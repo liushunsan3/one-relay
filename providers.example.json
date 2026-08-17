@@ -1,0 +1,9 @@
+[
+  {
+    "name": "myapi",
+    "baseUrl": "https://api.example.com/v1",
+    "key": "sk-your-api-key",
+    "models": ["model-a", "model-b"],
+    "aliases": { "gpt": "model-a" }
+  }
+]
