@@ -1132,13 +1132,15 @@ function statsTable(map) {
     const c = map[n];
     const rate = c.reqs ? Math.round(c.ok / c.reqs * 100) : 0;
     const avg = c.reqs ? Math.round(c.ms / c.reqs) : 0;
-    return `<tr><td>${escapeHtml(n)}</td><td>${c.reqs}</td><td>${c.ok}</td><td>${c.fail}</td><td>${rate}%</td><td>${avg}ms</td><td>${c.tin || '-'}</td><td>${c.tout || '-'}</td></tr>`;
+    return `<tr><td>${escapeHtml(n)}</td><td>${c.reqs}</td><td>${c.ok}</td><td>${c.fail}</td><td>${rate}%</td><td>${avg}ms</td><td>${c.tin || '-'}</td><td>${c.tout || '-'}</td><td>${c.cached ? fmtTokens(c.cached) : '-'}</td></tr>`;
   }).join('');
-  return `<thead><tr><th>名称</th><th>请求数</th><th>成功</th><th>失败</th><th>成功率</th><th>平均延迟</th><th>输入token</th><th>输出token</th></tr></thead><tbody>${rows}</tbody>`;
+  return `<thead><tr><th>名称</th><th>请求数</th><th>成功</th><th>失败</th><th>成功率</th><th>平均延迟</th><th>输入token</th><th>输出token</th><th>缓存命中</th></tr></thead><tbody>${rows}</tbody>`;
 }
 
-/* 模型用量环形图（Token 占比，纯 CSS conic-gradient 零依赖） */
+/* 模型用量环形图（Token 占比，纯 CSS conic-gradient 零依赖）
+   数据无变化时不重建 DOM（轮询调用防卡顿） */
 const DONUT_COLORS = ['#2962b9', '#1e8e4e', '#8e44ad', '#c62838', '#e67e22', '#00838f', '#b8860b', '#5d4037', '#607d8b'];
+let lastDonutKey = '';
 function fmtTokens(n) {
   if (n >= 1e8) return (n / 1e8).toFixed(1) + '亿';
   if (n >= 1e4) return (n / 1e4).toFixed(1) + '万';
@@ -1151,6 +1153,10 @@ function renderModelDonut(byModel) {
     .filter(x => x.tokens > 0)
     .sort((a, b) => b.tokens - a.tokens);
   const total = items.reduce((s, x) => s + x.tokens, 0);
+  const cachedTotal = Object.values(byModel || {}).reduce((s, c) => s + (c.cached || 0), 0);
+  const key = total + ':' + cachedTotal + ':' + items.map(x => `${x.m}=${x.tokens}`).join(',');
+  if (key === lastDonutKey) return; // 数据没变，跳过重建
+  lastDonutKey = key;
   if (!total) {
     box.innerHTML = '<div class="hint">暂无 Token 数据，发几个请求后自动生成占比图</div>';
     return;
@@ -1174,7 +1180,7 @@ function renderModelDonut(byModel) {
     </div>`).join('');
   box.innerHTML = `
     <div class="donut" style="background:conic-gradient(${gradient})">
-      <div class="donut-center"><div class="num">${fmtTokens(total)}</div><div class="unit">tokens 总量</div></div>
+      <div class="donut-center"><div class="num">${fmtTokens(total)}</div><div class="unit">计费 token${cachedTotal ? `<br>缓存命中 ${fmtTokens(cachedTotal)}` : ''}</div></div>
     </div>
     <div class="donut-list">${listHtml}</div>`;
 }
