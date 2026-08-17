@@ -221,17 +221,20 @@ textarea:focus-visible, select:focus-visible {
 .rec-vendor { opacity: .75; font-weight: normal; font-size: 11px; font-family: inherit; }
 
 /* ============ 聊天 ============ */
-.assistant-layout { display: grid; grid-template-columns: 1fr 320px; gap: var(--sp-4); }
+.assistant-layout { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: var(--sp-4); }
+.chat-col { min-width: 0; }
+.mem-col { min-width: 0; }
 .chat-box {
   height: 460px; min-height: 50vh; overflow-y: auto;
   border: 1px solid var(--border); border-radius: var(--r-lg);
   background: var(--card); padding: var(--sp-3); box-shadow: var(--shadow-sm);
 }
-.msg { margin-bottom: var(--sp-3); max-width: 92%; }
+.msg { margin-bottom: var(--sp-3); max-width: 92%; min-width: 0; }
 .msg .who { font-size: 11px; color: var(--muted); margin-bottom: 3px; }
 .msg .body {
   padding: var(--sp-2) var(--sp-3); border-radius: var(--r-lg);
   line-height: 1.55; white-space: pre-wrap; word-break: break-word;
+  overflow-wrap: anywhere; min-width: 0;
 }
 .msg.user .body { background: var(--primary); color: var(--primary-text); margin-left: auto; border-bottom-right-radius: var(--r-sm); }
 .msg.assistant .body { background: var(--chip); border-bottom-left-radius: var(--r-sm); }
@@ -335,7 +338,7 @@ textarea:focus-visible, select:focus-visible {
 .donut-center { position: relative; text-align: center; }
 .donut-center .num { font-size: var(--fs-xl); font-weight: 700; }
 .donut-center .unit { color: var(--muted); font-size: var(--fs-xs); }
-.donut-list { flex: 1; min-width: 240px; }
+.donut-list { flex: 1; min-width: 0; }
 .donut-item { display: flex; align-items: center; gap: var(--sp-2); padding: 4px 0; font-size: var(--fs-sm); }
 .donut-item .swatch { width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; }
 .donut-item .mname { flex: 1; font-family: Consolas, monospace; font-size: var(--fs-xs); word-break: break-all; }
