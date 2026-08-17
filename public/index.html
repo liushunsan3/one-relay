@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>路由代理控制台</title>
+<link rel="stylesheet" href="/style.css">
+<script>
+/* 防首次加载主题闪烁：CSS 渲染前先定主题 */
+(function(){try{var t=localStorage.getItem('rp_theme');if(!t&&matchMedia('(prefers-color-scheme: dark)').matches)t='dark';if(t)document.documentElement.dataset.theme=t;}catch(e){}})();
+</script>
+</head>
+<body>
+<div id="app">
+  <header class="topbar">
+    <div class="brand">🛰️ 路由代理控制台</div>
+    <div class="top-right">
+      <span id="connBadge" class="badge">连接中…</span>
+      <button id="themeBtn" class="btn ghost" title="切换深浅主题">🌓 主题</button>
+    </div>
+  </header>
+
+  <div id="offlineBanner" class="offline-banner hidden">⚠️ 服务重启中或不可达，恢复后将自动继续…</div>
+
+  <nav class="tabs" id="tabs">
+    <button data-tab="overview" class="active">📊 总览</button>
+    <button data-tab="providers">🗂️ Provider 管理</button>
+    <button data-tab="assistant">🤖 AI 助手</button>
+    <button data-tab="stats">📈 用量统计</button>
+    <button data-tab="logs">📜 日志</button>
+  </nav>
+
+  <main>
+    <!-- 总览 -->
+    <section id="tab-overview" class="tab-panel active">
+      <div id="setupGuide" class="card accent hidden"></div>
+      <div class="card-grid">
+        <div class="card accent" id="statusCard">加载中…</div>
+        <div class="card accent" id="accessCard">加载中…</div>
+      </div>
+      <div class="card">
+        <h3>Provider 健康状态</h3>
+        <div class="table-wrap"><table id="healthTable"></table></div>
+      </div>
+      <div class="card">
+        <h3>可用模型（<span id="modelCount">0</span> 个）
+          <button id="stabilityTestBtn" class="btn sm" style="margin-left:8px">🧪 测试稳定性</button>
+          <input id="modelSearch" class="input model-search" placeholder="🔍 搜索模型/站名…" style="margin-left:8px;width:170px">
+        </h3>
+        <div id="recommendedModels"></div>
+        <div id="modelGroups"></div>
+      </div>
+    </section>
+
+    <!-- Provider 管理 -->
+    <section id="tab-providers" class="tab-panel">
+      <div class="toolbar">
+        <button id="addProviderBtn" class="btn primary">➕ 新增中转站</button>
+        <button id="probeAllBtn" class="btn">🔍 全部探活</button>
+        <button id="smartRoutingBtn" class="btn">⚡ 智能路由</button>
+        <button id="cleanKickedBtn" class="btn danger">🧹 一键清理废站</button>
+        <span class="hint" id="routingHint">优先级：越靠前越优先（点击 ↑↓ 调整）</span>
+      </div>
+      <div class="card">
+        <div class="table-wrap"><table id="providerTable"></table></div>
+      </div>
+    </section>
+
+    <!-- AI 助手 -->
+    <section id="tab-assistant" class="tab-panel">
+      <div id="assistantSetup" class="card hidden">
+        <h3>🤖 配置 AI 助手</h3>
+        <p class="hint">助手使用独立 API（OpenAI 兼容），不走路由代理聚合池。填好地址和 key 后，模型列表自动拉取。</p>
+        <div class="form-grid">
+          <label>API 地址<input id="asBaseUrl" placeholder="https://api.example.com（可不带 /v1）"></label>
+          <label>API Key<input id="asKey" type="password" placeholder="sk-..."></label>
+          <label>模型
+            <div class="inline">
+              <select id="asModel"><option value="">— 先填地址和 key 再拉取 —</option></select>
+              <button id="asFetchModels" class="btn">拉取模型</button>
+            </div>
+          </label>
+        </div>
+        <button id="asSave" class="btn primary">保存配置</button>
+      </div>
+
+      <div id="assistantMain" class="hidden">
+        <div class="assistant-layout">
+          <div class="chat-col">
+            <div id="chatBox" class="chat-box"></div>
+            <div id="keyProtectNote" class="key-note hidden"></div>
+            <div class="chat-input-row">
+              <textarea id="chatInput" rows="3" placeholder="贴中转站资源（地址 + key），模型列表会自动探测。也可以直接问配置问题…"></textarea>
+              <button id="chatSend" class="btn primary">发送</button>
+            </div>
+            <div class="hint">🔒 消息中的 key（sk- 开头）会自动替换为占位符，真实 key 只保存在本页面，不会发送给 AI 模型。</div>
+          </div>
+          <div class="mem-col">
+            <div class="card">
+              <h3>🧠 记忆管理</h3>
+              <div id="memoryPanel">加载中…</div>
+            </div>
+            <div class="card">
+              <h3>🛠️ 其他操作</h3>
+              <button id="manualJsonBtn" class="btn">手动粘贴变更 JSON</button>
+              <button id="assistantConfigBtn" class="btn ghost">修改助手 API 配置</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 统计 -->
+    <section id="tab-stats" class="tab-panel">
+      <div class="toolbar">
+        <div class="seg" id="statsRange">
+          <button data-range="today" class="active">今天</button>
+          <button data-range="week">最近 7 天</button>
+          <button data-range="all">全部</button>
+        </div>
+        <button id="statsRefresh" class="btn">刷新</button>
+      </div>
+      <div class="card" id="donutCard">
+        <h3>模型用量（Token 占比）</h3>
+        <div id="modelDonut" class="donut-wrap"></div>
+      </div>
+      <div class="card-grid">
+        <div class="card"><h3>按站点统计</h3><div class="table-wrap"><table id="statsProviderTable"></table></div></div>
+        <div class="card"><h3>按模型统计</h3><div class="table-wrap"><table id="statsModelTable"></table></div></div>
+      </div>
+      <div class="card">
+        <h3>最近请求（每次上游尝试一条，含故障转移）</h3>
+        <div class="table-wrap"><table id="historyTable"></table></div>
+      </div>
+    </section>
+
+    <!-- 日志 -->
+    <section id="tab-logs" class="tab-panel">
+      <div class="toolbar">
+        <input id="logFilter" class="input" placeholder="关键词过滤…">
+        <label class="chk"><input type="checkbox" id="logAutoScroll" checked> 自动滚动</label>
+        <button id="logClear" class="btn ghost">清屏（仅显示）</button>
+      </div>
+      <div class="card dim">
+        <div id="logBox" class="log-box"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toasts"></div>
+
+<div id="modalRoot" class="modal-mask hidden">
+  <div class="modal" id="modalBody"></div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
