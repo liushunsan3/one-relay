@@ -1,0 +1,1461 @@
+/**
+ * OpenAI 兼容路由代理（故障转移 + 流式 + Web 管理面板）
+ * 由 supervisor.js 看护启动；也可单独 node router.js 调试（此时不做心跳自杀）
+ * 业务核心：多 provider 路由、别名映射、速度优先级、自动故障转移、SSE 透传
+ * 管理面板：/ 与 /admin/api/*（仅本机，Host/Origin 校验）
+ * 注意规范：所有日志禁止输出 key 明文
+ */
+const http = require('http');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+
+const APP_DIR = __dirname;
+const TAG = process.env.RP_PORT && process.env.RP_PORT !== '3099' ? process.env.RP_PORT : 'main';
+const MY_PORT = parseInt(process.env.RP_PORT || '3099', 10);
+const HOST = '127.0.0.1';
+const UPSTREAM_TIMEOUT = 60000;
+const startedAt = Date.now();
+
+// ============ 日志环形缓冲（管理面板增量拉取） ============
+const LOG_RING_MAX = 1000;
+const logRing = [];
+let logSeq = 0;
+{
+  const origLog = console.log;
+  console.log = (...args) => {
+    const line = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+    origLog(...args);
+    logRing.push({ c: ++logSeq, t: Date.now(), line });
+    if (logRing.length > LOG_RING_MAX) logRing.shift();
+  };
+}
+
+// ============ providers 配置 ============
+const configPath = path.join(APP_DIR, 'providers.json');
+// 首次运行：无配置则生成空模板，引导从面板/AI 助手添加（不崩溃）
+if (!fs.existsSync(configPath)) {
+  try { atomicWrite(configPath, JSON.stringify([], null, 2)); } catch (e) {}
+  console.log('🆕 未检测到 providers.json，已生成空配置：请打开管理面板添加中转站（或直接把地址+key 贴给 AI 助手）');
+}
+const providerList = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+
+const PROVIDERS = {};
+function loadProviders(list) {
+  const map = {};
+  for (const p of list) {
+    map[p.name] = { baseUrl: p.baseUrl, key: p.key, models: p.models, aliases: p.aliases || {}, enabled: p.enabled !== false };
+  }
+  return map;
+}
+Object.assign(PROVIDERS, loadProviders(providerList));
+
+// ============ settings 配置（热加载） ============
+const settingsPath = path.join(APP_DIR, 'settings.json');
+let settings = {
+  apiKey: 'sk-router',
+  priority: [],
+  assistant: { baseUrl: '', key: '', model: '' },
+  probeIntervalMin: 30,
+  autoKick: true,       // 废站自动踢（探活3连败+复验确认）
+  smartRouting: true,   // 动态选最快站（false 回退固定优先级）
+};
+try {
+  settings = { ...settings, ...JSON.parse(fs.readFileSync(settingsPath, 'utf-8')) };
+} catch (e) {
+  console.log(`settings.json 读取失败，使用默认配置: ${e.message}`);
+}
+// 首次运行：无 settings 则落盘默认值，方便用户直接编辑
+if (!fs.existsSync(settingsPath)) {
+  try { atomicWrite(settingsPath, JSON.stringify(settings, null, 2)); } catch (e) {}
+  console.log('🆕 已生成默认 settings.json');
+}
+let settingsReloadTimer = null;
+fs.watchFile(settingsPath, { interval: 1000 }, () => {
+  clearTimeout(settingsReloadTimer);
+  settingsReloadTimer = setTimeout(() => {
+    try {
+      const fresh = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+      settings = { ...settings, ...fresh };
+      scheduleProbe();
+      console.log(`\n⚙️ [${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] settings 已热加载: apiKey=*** 优先级=${(settings.priority || []).length} 项\n`);
+    } catch (e) {
+      console.log(`\n❌ settings 热加载失败（保留旧配置）: ${e.message}\n`);
+    }
+  }, 2000);
+});
+
+function configMtime() {
+  try { return fs.statSync(configPath).mtimeMs; } catch (e) { return 0; }
+}
+
+// ============ providers 热加载 ============
+let reloadTimer = null;
+fs.watchFile(configPath, { interval: 1000 }, () => {
+  clearTimeout(reloadTimer);
+  reloadTimer = setTimeout(() => {
+    try {
+      const fresh = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      if (!Array.isArray(fresh) || fresh.length === 0) throw new Error('配置为空或格式不对');
+      const next = loadProviders(fresh);
+      for (const k of Object.keys(PROVIDERS)) delete PROVIDERS[k];
+      Object.assign(PROVIDERS, next);
+      providerList.length = 0;
+      providerList.push(...fresh);
+      // 清理已删站的探活/健康状态（防幽灵行）；统计聚合保留（历史事实）
+      const names = new Set(fresh.map(p => p.name));
+      for (const n of Object.keys(providerHealth)) if (!names.has(n)) delete providerHealth[n];
+      for (const n of Object.keys(probeState)) if (!names.has(n)) delete probeState[n];
+      for (const n of Object.keys(PROVIDERS)) computeProviderScore(n); // 配置变化后评分全量重算
+      const allModels = [...new Set(Object.values(PROVIDERS).flatMap(p => [...p.models, ...Object.keys(p.aliases)]))];
+      console.log(`\n🔄 [${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 配置已热加载: ${fresh.length} 个 provider, ${allModels.length} 个模型\n`);
+    } catch (e) {
+      console.log(`\n❌ [${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 热加载失败（保留旧配置）: ${e.message}\n`);
+    }
+  }, 2000);
+});
+
+// ============ 故障转移状态 ============
+const providerHealth = {};
+const MAX_FAILURES = 3;
+const HEALTH_CHECK_INTERVAL = 5 * 60 * 1000;
+
+// ============ 模型级健康（供 /v1/models 按实际可用性过滤） ============
+const modelHealth = {};
+const MODEL_FAIL_THRESHOLD = 2;             // 连续失败 2 次即视为不可用
+const MODEL_FAIL_WINDOW = 10 * 60 * 1000;   // 10 分钟内无失败则自动恢复
+
+function markModelFailed(model) {
+  if (!model) return;
+  const h = modelHealth[model] || (modelHealth[model] = { fails: 0, lastFail: 0 });
+  h.fails++;
+  h.lastFail = Date.now();
+}
+function markModelSuccess(model) {
+  if (model && modelHealth[model]) { modelHealth[model].fails = 0; modelHealth[model].lastFail = 0; }
+}
+function isModelUnavailable(model) {
+  const h = modelHealth[model];
+  if (!h) return false;
+  if (Date.now() - h.lastFail > MODEL_FAIL_WINDOW) { h.fails = 0; h.lastFail = 0; return false; }
+  return h.fails >= MODEL_FAIL_THRESHOLD;
+}
+
+function isProviderHealthy(providerName) {
+  const health = providerHealth[providerName];
+  if (!health) return true;
+  if (Date.now() - health.lastFailTime > HEALTH_CHECK_INTERVAL) {
+    health.failures = 0;
+    return true;
+  }
+  return health.failures < MAX_FAILURES;
+}
+
+function markProviderFailed(providerName) {
+  if (!providerHealth[providerName]) {
+    providerHealth[providerName] = { failures: 0, lastFailTime: 0 };
+  }
+  providerHealth[providerName].failures++;
+  providerHealth[providerName].lastFailTime = Date.now();
+  console.log(`  ⚠️  ${providerName} 失败次数: ${providerHealth[providerName].failures}/${MAX_FAILURES}`);
+}
+
+function markProviderSuccess(providerName) {
+  if (providerHealth[providerName]) {
+    providerHealth[providerName].failures = 0;
+  }
+}
+
+// ============ 原子写与托盘通知 ============
+function atomicWrite(file, data) {
+  const tmp = file + '.tmp';
+  fs.writeFileSync(tmp, data);
+  fs.renameSync(tmp, file);
+}
+const TRAY_CMD_FILE = path.join(APP_DIR, `tray-cmd-${TAG}.txt`);
+function sendNotify(msg) {
+  try { fs.appendFileSync(TRAY_CMD_FILE, `notify:${msg}\n`); } catch (e) {}
+}
+// 清理上次异常退出的 .tmp 残留
+try {
+  for (const f of fs.readdirSync(APP_DIR)) {
+    if (f.endsWith('.tmp')) { try { fs.unlinkSync(path.join(APP_DIR, f)); } catch (e) {} }
+  }
+} catch (e) {}
+
+function shouldFailover(statusCode, body) {
+  if (statusCode === 400 || statusCode === 401 || statusCode === 402 || statusCode === 403 || statusCode === 424 || statusCode === 429) return true;
+  if (statusCode === 404) return true;
+  const text = (body || '').toLowerCase();
+  const keywords = ['quota', 'insufficient', 'balance', 'payment required', 'rate limit',
+    'over quota', '额度', '余额', '付款', '超出', '限流', 'no available channel',
+    'service temporarily unavailable', 'unavailable', 'model not found', 'model_not_found'];
+  if (statusCode >= 500 && keywords.some(kw => text.includes(kw))) return true;
+  return keywords.some(kw => text.includes(kw));
+}
+
+// 模型级错误（站还活着、但该模型本身不可用）：用于动态从可用模型列表剔除
+function isModelLevelError(statusCode, body, validCompletion) {
+  if (statusCode === 424 || statusCode === 404) return true;
+  if (statusCode >= 200 && statusCode < 300 && !validCompletion) return true; // 200 但空响应
+  const text = (body || '').toLowerCase();
+  return text.includes('model not found') || text.includes('model_not_found') || text.includes('service temporarily unavailable');
+}
+
+// ============ 请求体清洗 ============
+function sanitizeBody(parsed, realModel) {
+  const out = { model: realModel };
+
+  let messages = Array.isArray(parsed.messages) ? parsed.messages.map(fixMessage) : [];
+  if (parsed.system !== undefined) {
+    let sysText = '';
+    if (typeof parsed.system === 'string') sysText = parsed.system;
+    else if (Array.isArray(parsed.system)) {
+      sysText = parsed.system.map(b => (typeof b === 'string' ? b : (b && b.text) || '')).join('\n\n');
+    }
+    if (sysText) messages = [{ role: 'system', content: sysText }, ...messages];
+  }
+  out.messages = messages;
+
+  if (typeof parsed.stream === 'boolean') out.stream = parsed.stream;
+  if (parsed.temperature !== undefined) out.temperature = parsed.temperature;
+  if (parsed.top_p !== undefined) out.top_p = parsed.top_p;
+  if (typeof parsed.stop === 'string' || Array.isArray(parsed.stop)) out.stop = parsed.stop;
+  if (parsed.presence_penalty !== undefined) out.presence_penalty = parsed.presence_penalty;
+  if (parsed.frequency_penalty !== undefined) out.frequency_penalty = parsed.frequency_penalty;
+  if (parsed.max_tokens !== undefined) out.max_tokens = Math.min(Number(parsed.max_tokens) || 8192, 32768);
+  if (Array.isArray(parsed.tools) && parsed.tools.length > 0) out.tools = parsed.tools.map(fixTool);
+  if (parsed.tool_choice !== undefined) out.tool_choice = parsed.tool_choice;
+  if (parsed.response_format !== undefined) out.response_format = parsed.response_format;
+  if (Array.isArray(parsed.stop_sequences) && out.stop === undefined) out.stop = parsed.stop_sequences;
+
+  return out;
+}
+
+function fixMessage(msg) {
+  if (!msg || typeof msg !== 'object') return { role: 'user', content: String(msg) };
+  const fixed = { ...msg };
+  if (Array.isArray(fixed.content)) {
+    const parts = fixed.content.map(b => {
+      if (typeof b === 'string') return b;
+      if (b && b.type === 'text' && typeof b.text === 'string') return b.text;
+      return '';
+    }).filter(s => s.length > 0);
+    if (parts.length > 0 && fixed.content.every(b => typeof b === 'string' || (b && b.type === 'text'))) {
+      fixed.content = parts.join('\n');
+    }
+  }
+  if (typeof fixed.content !== 'string' && !Array.isArray(fixed.content)) {
+    fixed.content = JSON.stringify(fixed.content);
+  }
+  return fixed;
+}
+
+function fixTool(tool) {
+  if (!tool || typeof tool !== 'object') return tool;
+  if (tool.input_schema && !tool.function) {
+    return {
+      type: 'function',
+      function: {
+        name: tool.name,
+        description: tool.description || '',
+        parameters: tool.input_schema,
+      }
+    };
+  }
+  return tool;
+}
+
+// ============ 路由逻辑 ============
+function findProviders(modelName) {
+  const name = (modelName || '').toLowerCase();
+  const matches = [];
+  for (const [providerName, p] of Object.entries(PROVIDERS)) {
+    if (p.enabled === false) continue; // 手动禁用的站跳过
+    const alias = Object.entries(p.aliases).find(([k]) => k.toLowerCase() === name);
+    if (alias) {
+      matches.push({ provider: providerName, config: p, realModel: alias[1] });
+      continue;
+    }
+    if (p.models.some(m => m.toLowerCase() === name)) {
+      matches.push({ provider: providerName, config: p, realModel: name });
+    }
+  }
+  return matches;
+}
+
+function sortCandidates(matches) {
+  const pr = settings.priority || [];
+  // 智能路由：按评分降序选当前最快可用站（同分用固定优先级 tiebreaker）
+  if (settings.smartRouting !== false) {
+    return [...matches].sort((a, b) => {
+      const sa = (providerScores[a.provider] || {}).score ?? -1;
+      const sb = (providerScores[b.provider] || {}).score ?? -1;
+      if (sb !== sa) return sb - sa;
+      const pa = pr.indexOf(a.provider);
+      const pb = pr.indexOf(b.provider);
+      return (pa === -1 ? 999 : pa) - (pb === -1 ? 999 : pb);
+    });
+  }
+  // 固定优先级（传统模式，settings.smartRouting=false 时回退）
+  return [...matches].sort((a, b) => {
+    const pa = pr.indexOf(a.provider);
+    const pb = pr.indexOf(b.provider);
+    return (pa === -1 ? 999 : pa) - (pb === -1 ? 999 : pb);
+  });
+}
+
+// ============ 站点评分（智能路由依据；评分错不影响主流程） ============
+const providerScores = {}; // name -> { score, detail, ms }
+function computeProviderScore(name) {
+  try {
+    const p = PROVIDERS[name];
+    if (!p || p.enabled === false) { providerScores[name] = { score: -1, detail: '停用/踢出' }; return; }
+    const probe = probeState[name];
+    const probedOk = probe && probe.ok;
+    let score = 0;
+    const detail = [];
+    // ① 探活基础分 40
+    if (probedOk) { score += 40; detail.push('探活+40'); }
+    // ② 成功率 40：当日分桶，样本≥5 用真实值；不足按乐观 70%（防新站/凌晨饿死；恰好样本全败用真实值）
+    const b = stats[todayKey()];
+    const cell = b && b.byProvider[name];
+    let rate = 0.7;
+    if (cell && cell.reqs >= 5) rate = cell.ok / cell.reqs;
+    score += rate * 40;
+    detail.push(`成功率${Math.round(rate * 100)}%+${Math.round(rate * 40)}`);
+    // ③ 延迟分 20：当日有真实请求用请求平均延迟（比探活延迟准），否则探活延迟
+    let lat = null;
+    if (cell && cell.reqs > 0) lat = cell.ms / cell.reqs;
+    else if (probedOk) lat = probe.ms;
+    if (lat != null) {
+      const d = Math.max(0, (2000 - lat) / 2000) * 20;
+      score += d;
+      detail.push(`延迟${Math.round(lat)}ms+${Math.round(d)}`);
+    }
+    // ④ 探活不通：总分 ×0.3 封顶（刚挂的站不被历史高分误选）
+    if (probe && !probe.busy && !probe.ok) { score *= 0.3; detail.push('探活挂×0.3'); }
+    providerScores[name] = { score: Math.round(score), detail: detail.join(' '), ms: lat == null ? null : Math.round(lat) };
+  } catch (e) {
+    providerScores[name] = { score: 0, detail: '评分出错' };
+  }
+}
+
+// ============ 发送请求（支持流式透传） ============
+function sendRequest(options, body) {
+  return new Promise((resolve, reject) => {
+    const transport = options.protocol === 'https:' ? https : http;
+    const req = transport.request(options, (proxyRes) => {
+      const contentType = proxyRes.headers['content-type'] || '';
+      if (proxyRes.statusCode === 200 && contentType.includes('text/event-stream')) {
+        resolve({ statusCode: proxyRes.statusCode, headers: proxyRes.headers, stream: proxyRes });
+        return;
+      }
+      let data = '';
+      proxyRes.on('data', chunk => { data += chunk; });
+      proxyRes.on('end', () => {
+        resolve({ statusCode: proxyRes.statusCode, headers: proxyRes.headers, body: data });
+      });
+    });
+
+    req.setTimeout(UPSTREAM_TIMEOUT, () => {
+      req.destroy(new Error('upstream timeout'));
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+function isValidCompletion(body) {
+  if (!body) return false;
+  if (body.includes('"choices":null') || body.includes('"choices":[]')) return false;
+  return true;
+}
+
+function buildOptions(cand, upstreamPath, targetBody) {
+  const baseClean = cand.config.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '');
+  const pathClean = upstreamPath.startsWith('/v1/') ? upstreamPath : upstreamPath.replace(/^\//, '');
+  const targetUrl = new URL(baseClean + pathClean);
+  return {
+    hostname: targetUrl.hostname,
+    port: targetUrl.port || (targetUrl.protocol === 'https:' ? 443 : 80),
+    path: targetUrl.pathname + targetUrl.search,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${cand.config.key}`,
+      'Content-Length': Buffer.byteLength(targetBody),
+    },
+    protocol: targetUrl.protocol,
+    agent: targetUrl.protocol === 'https:' ? httpsAgent : httpAgent,
+  };
+}
+
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 10 });
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 10 });
+
+// ============ 用量统计（按天分桶）+ 请求历史 ============
+const statsPath = path.join(APP_DIR, 'stats.json');
+let stats = {};      // { 'YYYY-MM-DD': { byProvider:{}, byModel:{}, clientReqs, clientOk } }
+let reqHistory = []; // 最近 200 条上游尝试
+try {
+  const saved = JSON.parse(fs.readFileSync(statsPath, 'utf-8'));
+  stats = saved.stats || {};
+  reqHistory = saved.history || [];
+} catch (e) { /* 首次运行 */ }
+
+function todayKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+function todayBucket() {
+  const k = todayKey();
+  if (!stats[k]) stats[k] = { byProvider: {}, byModel: {}, clientReqs: 0, clientOk: 0 };
+  return stats[k];
+}
+function ensureCell(map, name) {
+  if (!map[name]) map[name] = { reqs: 0, ok: 0, fail: 0, ms: 0, tin: 0, tout: 0 };
+  return map[name];
+}
+function recordAttempt(model, provider, ms, code, ok, stream, usage) {
+  const b = todayBucket();
+  const p = ensureCell(b.byProvider, provider);
+  p.reqs++; ok ? p.ok++ : p.fail++; p.ms += ms;
+  if (usage) { p.tin += usage.prompt_tokens || 0; p.tout += usage.completion_tokens || 0; }
+  const m = ensureCell(b.byModel, model);
+  m.reqs++; ok ? m.ok++ : m.fail++; m.ms += ms;
+  if (usage) { m.tin += usage.prompt_tokens || 0; m.tout += usage.completion_tokens || 0; }
+  reqHistory.push({ t: Date.now(), model, provider, ms: Math.round(ms), code, ok, stream: !!stream });
+  if (reqHistory.length > 200) reqHistory.splice(0, reqHistory.length - 200);
+  computeProviderScore(provider); // 评分随请求实时更新
+  scheduleStatsSave();
+}
+function recordClientResult(ok) {
+  const b = todayBucket();
+  b.clientReqs++;
+  if (ok) b.clientOk++;
+  scheduleStatsSave();
+}
+function recordStreamTokens(provider, model, usage) {
+  if (!usage) return;
+  const b = todayBucket();
+  const p = ensureCell(b.byProvider, provider);
+  p.tin += usage.prompt_tokens || 0; p.tout += usage.completion_tokens || 0;
+  const m = ensureCell(b.byModel, model);
+  m.tin += usage.prompt_tokens || 0; m.tout += usage.completion_tokens || 0;
+  scheduleStatsSave();
+}
+let statsTimer = null;
+function scheduleStatsSave() {
+  if (statsTimer) return;
+  statsTimer = setTimeout(() => {
+    statsTimer = null;
+    try { fs.writeFileSync(statsPath, JSON.stringify({ stats, history: reqHistory })); } catch (e) {}
+  }, 30000);
+}
+// 只保留最近 60 天分桶
+setInterval(() => {
+  const keys = Object.keys(stats).sort();
+  while (keys.length > 60) delete stats[keys.shift()];
+}, 3600 * 1000).unref();
+
+function summarizeStats(range) {
+  const keys = Object.keys(stats).sort().reverse();
+  const use = range === 'today' ? keys.slice(0, 1) : range === 'week' ? keys.slice(0, 7) : keys;
+  const byProvider = {}, byModel = {};
+  let clientReqs = 0, clientOk = 0;
+  for (const k of use) {
+    const b = stats[k];
+    if (!b) continue;
+    clientReqs += b.clientReqs || 0;
+    clientOk += b.clientOk || 0;
+    for (const [n, c] of Object.entries(b.byProvider || {})) {
+      const t = ensureCell(byProvider, n);
+      t.reqs += c.reqs; t.ok += c.ok; t.fail += c.fail; t.ms += c.ms; t.tin += c.tin; t.tout += c.tout;
+    }
+    for (const [n, c] of Object.entries(b.byModel || {})) {
+      const t = ensureCell(byModel, n);
+      t.reqs += c.reqs; t.ok += c.ok; t.fail += c.fail; t.ms += c.ms; t.tin += c.tin; t.tout += c.tout;
+    }
+  }
+  return { days: use, byProvider, byModel, clientReqs, clientOk };
+}
+
+// ============ 探活（与故障转移计数完全隔离，仅展示） ============
+const probeState = {}; // name -> { ok, ms, err, time, busy }
+let probeTimer = null;
+function scheduleProbe() {
+  if (probeTimer) { clearInterval(probeTimer); probeTimer = null; }
+  const min = Math.max(1, Number(settings.probeIntervalMin) || 30);
+  probeTimer = setInterval(() => runProbeAll(), min * 60 * 1000);
+  probeTimer.unref();
+}
+function httpGetJson(url, headers, timeoutMs) {
+  return new Promise((resolve) => {
+    const u = new URL(url);
+    const transport = u.protocol === 'https:' ? https : http;
+    const started = Date.now();
+    const req = transport.get(url, { headers, timeout: timeoutMs }, (res) => {
+      let data = '';
+      res.on('data', c => { data += c; if (data.length > 500000) req.destroy(); });
+      res.on('end', () => resolve({ ok: res.statusCode === 200, status: res.statusCode, ms: Date.now() - started, body: data }));
+      res.resume();
+    });
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('error', (e) => resolve({ ok: false, status: 0, ms: Date.now() - started, err: e.message }));
+  });
+}
+async function probeOne(name) {
+  const p = PROVIDERS[name];
+  if (!p || p.enabled === false) { delete probeState[name]; return; } // 已踢出/停用：不再探测
+  probeState[name] = { ...(probeState[name] || {}), busy: true };
+  const t0 = Date.now();
+  const r = await sniffModels(p.baseUrl, p.key); // 复用路径嗅探，避免 /v1/v1 双拼
+  probeState[name] = {
+    ok: r.ok, ms: Date.now() - t0,
+    err: r.ok ? '' : r.err,
+    time: Date.now(), busy: false,
+  };
+  computeProviderScore(name); // 评分随探活实时更新
+  // 自动踢判定：连续 3 次失败 → 当轮立即复验 → 仍失败确认真死才踢
+  if (r.ok) { probeFailStreak[name] = 0; return; }
+  probeFailStreak[name] = (probeFailStreak[name] || 0) + 1;
+  if (probeFailStreak[name] >= 3 && settings.autoKick !== false) {
+    try {
+      const again = await sniffModels(p.baseUrl, p.key); // 复验
+      if (!again.ok) await kickProvider(name);
+      else probeFailStreak[name] = 0; // 复验活了：重置计数
+    } catch (e) { console.log(`踢出检查出错(${name}): ${e.message}`); }
+  }
+}
+
+const probeFailStreak = {}; // 连续探活失败计数（内存态，重启重数）
+
+// 踢出废站：enabled=false + disabledBy:auto + 通知（含受影响模型）+ 记录历史
+async function kickProvider(name) {
+  try {
+    const before = availableModels();
+    const list = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    const item = list.find(x => x.name === name);
+    if (!item || item.enabled === false) return;
+    item.enabled = false;
+    item.disabledBy = 'auto';
+    // 同步内存（不等热加载），保证受影响模型即时算对
+    if (PROVIDERS[name]) PROVIDERS[name].enabled = false;
+    const after = availableModels();
+    const lost = before.filter(m => !after.includes(m));
+    const lostNote = lost.length ? `，受影响模型：${lost.slice(0, 8).join('、')}${lost.length > 8 ? ' …' : ''}` : '';
+    const err = writeProviders(list);
+    if (err) { console.log(`踢出 ${name} 写入失败: ${err}`); return; }
+    probeFailStreak[name] = 0;
+    delete probeState[name]; // 停止探活展示（杜绝「已踢出+探活绿」矛盾）
+    computeProviderScore(name); // 评分归 -1（UI 不显示旧正分）
+    addChangelog('自动', `踢出废站 ${name}（探活连续失败+复验确认）${lostNote}`);
+    sendNotify(`站点 ${name} 已自动踢出${lostNote}。可在 Provider 页手动启用或一键清理`);
+    console.log(`  🥊 已自动踢出废站: ${name}${lostNote}`);
+  } catch (e) { console.log(`踢出 ${name} 出错: ${e.message}`); }
+}
+function runProbeAll() {
+  for (const n of Object.keys(PROVIDERS)) probeOne(n);
+}
+
+// ============ 模型列表探测（多路径嗅探，供助手与表单用） ============
+function normalizeBase(url) {
+  return String(url || '').trim().replace(/\/+$/, '');
+}
+async function sniffModels(rawBase, key) {
+  const b = normalizeBase(rawBase);
+  if (!/^https?:\/\//.test(b)) return { ok: false, err: '地址必须以 http:// 或 https:// 开头' };
+  const paths = [b + '/v1/models'];
+  if (/\/v\d+$/.test(b)) paths.push(b + '/models');
+  let lastStatus = 0, lastErr = '';
+  for (const u of paths) {
+    const r = await httpGetJson(u, { Authorization: `Bearer ${key}` }, 12000);
+    if (r.ok) {
+      try {
+        const j = JSON.parse(r.body);
+        const ids = (j.data || j.models || []).map(x => x.id || x.name || String(x)).filter(Boolean);
+        return { ok: true, models: ids, via: u.replace(/\/models$/, ''), count: ids.length };
+      } catch (e) { lastErr = '响应不是有效 JSON'; }
+    } else {
+      lastStatus = r.status; lastErr = r.err || '';
+    }
+  }
+  let err;
+  if (lastStatus === 401 || lastStatus === 403) err = 'key 无效或无权限';
+  else if (lastStatus === 404) err = '未找到模型列表端点（路径不对）';
+  else if (lastStatus === 0) err = `网络不通（${lastErr}）`;
+  else err = `HTTP ${lastStatus}`;
+  return { ok: false, err };
+}
+
+// ============ 记忆库（自愈） ============
+const memoryPath = path.join(APP_DIR, 'memory.json');
+let memory = { changelog: [], stash: [], preferences: [] };
+try {
+  const m = JSON.parse(fs.readFileSync(memoryPath, 'utf-8'));
+  memory = { changelog: m.changelog || [], stash: m.stash || [], preferences: m.preferences || [] };
+} catch (e) {
+  try { fs.renameSync(memoryPath, `${memoryPath}.broken-${Date.now()}`); } catch (e2) {}
+  console.log('memory.json 损坏已隔离，重建空记忆库');
+}
+function saveMemory() {
+  if (memory.changelog.length > 200) memory.changelog.splice(0, memory.changelog.length - 200);
+  if (memory.stash.length > 20) memory.stash.splice(0, memory.stash.length - 20);
+  try { atomicWrite(memoryPath, JSON.stringify(memory, null, 2)); } catch (e) {}
+}
+function addChangelog(source, detail) {
+  memory.changelog.push({
+    time: new Date().toLocaleString('zh-CN', { hour12: false }),
+    source, detail,
+  });
+  saveMemory();
+}
+
+// ============ providers.json 写入（校验 + .bak 轮换3份 + 未知字段保留） ============
+function validateProviders(list) {
+  if (!Array.isArray(list) || list.length === 0) return '配置必须是非空数组';
+  const names = new Set();
+  for (const p of list) {
+    if (!p || typeof p.name !== 'string' || !p.name.trim()) return '存在缺少 name 的 provider';
+    if (names.has(p.name)) return `provider 名称重复: ${p.name}`;
+    names.add(p.name);
+    if (typeof p.baseUrl !== 'string' || !/^https?:\/\//.test(p.baseUrl)) return `${p.name}: baseUrl 必须是 http(s) 地址`;
+    if (typeof p.key !== 'string' || !p.key) return `${p.name}: 缺少 key`;
+    if (!Array.isArray(p.models) || p.models.length === 0) return `${p.name}: models 必须是非空数组`;
+    if (p.aliases && typeof p.aliases !== 'object') return `${p.name}: aliases 必须是对象`;
+  }
+  return null;
+}
+function backupProviders() {
+  try {
+    const rot = (a, b) => { try { fs.renameSync(configPath + a, configPath + b); } catch (e) {} };
+    rot('.bak2', '.bak3');
+    rot('.bak1', '.bak2');
+    rot('.bak', '.bak1');
+    fs.copyFileSync(configPath, configPath + '.bak');
+  } catch (e) {}
+}
+function writeProviders(list) {
+  const err = validateProviders(list);
+  if (err) return err;
+  backupProviders();
+  atomicWrite(configPath, JSON.stringify(list, null, 2));
+  return null; // 热加载 2 秒后自动生效
+}
+function maskKey(key) {
+  const t = String(key || '');
+  if (!t) return '';
+  return t.length <= 8 ? '***' : t.slice(0, 3) + '***' + t.slice(-4);
+}
+function maskProvider(p) {
+  return { ...p, key: maskKey(p.key) };
+}
+
+// ============ AI 助手 ============
+const ASSISTANT_SYSTEM = `你是「中转站配置助手」，服务于运行在本机的 AI 路由代理（聚合多个 OpenAI 兼容中转站，对外提供统一 /v1 接口），只负责配置相关事务。
+
+## 职责
+1. 解析用户贴来的中转站资源（地址、key 占位符、模型信息），生成 providers.json 变更提案
+2. 管理和回忆配置记忆（用户偏好、变更历史、未应用的暂存资源）
+3. 回答配置相关问题（哪个模型在哪个站、优先级、故障转移逻辑等）
+
+## 变更提案协议（严格遵守）
+- 先用中文简要说明，再输出一个 json 代码块，内容为操作数组（支持一次多个操作）：
+\`\`\`json
+[{"action":"add","provider":{"name":"站标识","baseUrl":"https://...","key":"{{KEY_1}}","models":["模型A","模型B"],"aliases":{"统一别名":"真实模型名"},"enabled":true}}]
+\`\`\`
+- action 取值：add（新增）/ update（更新，需输出完整对象，把不变字段的原值带上）/ delete（删除，只需 name）
+- baseUrl 只能来自用户消息原文，禁止编造或修改域名
+- models 只能来自用户提供的列表或系统自动探测结果，禁止编造；信息不全时先追问
+- 新站的常用对话模型应尽量映射到现有统一别名（如 glm-5.2、glm-5.2-0815、deepseek-v4-flash），保持客户端无感
+- key 一律使用 {{KEY_n}} 占位符（真实 key 由本地系统保管，你看不到也不需要）
+
+## 记忆协议
+- 需要记住用户偏好或事实时，在回复末尾单独一行输出：{"memory":{"remember":"要点"}}
+- 每轮最多保存一条记忆
+
+## 可用工具
+当用户要求执行以下操作时，先简要说明你准备做什么，再在回复末尾单独一行输出对应的工具块（系统会执行并把结果回传给你，你再据此用中文总结）。工具块必须单独成行：
+- 测试模型稳定性（找出真正稳定的模型）：{"tool":"stability-test"}
+- 查看服务状态（哪些站挂了、可用/推荐模型、重启次数）：{"tool":"status"}
+- 探测全部站点连通性：{"tool":"probe"}
+- 测试单个站（需指定站名）：{"tool":"test","name":"站名"}
+- 查看用量统计（range 可选 today/week/all）：{"tool":"stats","range":"today"}
+- 查看最近日志（n 可选条数，默认30）：{"tool":"logs","n":30}
+- 调整站点优先级（action: top 置顶/bottom 置底/up 上移/down 下移）：{"tool":"priority","name":"站名","action":"top"}
+- 启用或停用某站（enabled: true 启用/false 停用，停用后路由不再走此站但配置保留）：{"tool":"toggle","name":"站名","enabled":false}
+其他情况不要输出工具块。
+
+## 行为规范
+- 与配置无关的请求：一句话说明职责后拒绝，不闲聊
+- 回答用中文，简洁直接，不确定就追问`;
+
+function configSummary() {
+  const lines = [];
+  for (const [name, p] of Object.entries(PROVIDERS)) {
+    const alias = Object.keys(p.aliases).length ? ' 别名:' + JSON.stringify(p.aliases) : '';
+    lines.push(`- ${name} | ${p.baseUrl} | 模型: ${p.models.join(', ')}${alias}${p.enabled === false ? ' | [已禁用]' : ''} | key: 已配置（保密）`);
+  }
+  lines.push(`优先级（快→慢）: ${(settings.priority || []).join(' → ') || '（默认顺序）'}`);
+  return lines.join('\n');
+}
+function memorySummary() {
+  let s = '';
+  if (memory.preferences.length) s += '### 用户偏好\n' + memory.preferences.map(x => `- ${x}`).join('\n') + '\n';
+  if (memory.changelog.length) s += '### 最近变更历史\n' + memory.changelog.slice(-10).map(c => `- ${c.time} [${c.source}] ${c.detail}`).join('\n') + '\n';
+  if (memory.stash.length) s += '### 未应用的暂存资源（可提醒用户处理）\n' + memory.stash.map(x => `- ${x.time} ${x.summary}`).join('\n');
+  return s || '（暂无记忆）';
+}
+function assistantFriendlyError(status, errText) {
+  if (status === 401 || status === 403) return `助手 API key 无效或无权限（HTTP ${status}）`;
+  if (status === 402) return '助手 API 欠费（HTTP 402）';
+  if (status === 404) return `助手 API 地址或模型名不对（HTTP 404）`;
+  if (status === 429) return '助手 API 限流，稍后再试（HTTP 429）';
+  if (status === 0) return `助手 API 网络不通（${errText || '超时'}）`;
+  return `助手 API 异常（HTTP ${status}）`;
+}
+function handleAssistant(req, res, body) {
+  const a = settings.assistant || {};
+  if (!a.baseUrl || !a.key || !a.model) {
+    sendJSON(res, 400, { error: '助手 API 未配置，请先在「AI 助手」页填写地址、key 和模型' });
+    return;
+  }
+  let parsed;
+  try { parsed = JSON.parse(body); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+  const history = (Array.isArray(parsed.history) ? parsed.history : [])
+    .filter(m => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content)
+    .slice(-20);
+
+  const sys = `${ASSISTANT_SYSTEM}\n\n## 当前配置实时摘要（以此为准）\n${configSummary()}\n\n## 配置记忆\n${memorySummary()}`;
+  const messages = [{ role: 'system', content: sys }, ...history];
+
+  const base = normalizeBase(a.baseUrl).replace(/\/v1$/, '');
+  const target = new URL(base + '/v1/chat/completions');
+  const payload = JSON.stringify({ model: a.model, messages, stream: true });
+  const transport = target.protocol === 'https:' ? https : http;
+  const upReq = transport.request({
+    hostname: target.hostname,
+    port: target.port || (target.protocol === 'https:' ? 443 : 80),
+    path: target.pathname,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${a.key}`,
+      'Content-Length': Buffer.byteLength(payload),
+    },
+    timeout: 180000,
+  }, (upRes) => {
+    if (upRes.statusCode !== 200 || !(upRes.headers['content-type'] || '').includes('event-stream')) {
+      let data = '';
+      upRes.on('data', c => { data += c; });
+      upRes.on('end', () => {
+        sendJSON(res, 502, { error: assistantFriendlyError(upRes.statusCode, data.slice(0, 200)) });
+      });
+      return;
+    }
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    });
+    upRes.pipe(res);
+    res.on('close', () => { if (!upRes.destroyed) upRes.destroy(); });
+  });
+  upReq.on('timeout', () => upReq.destroy(new Error('timeout')));
+  upReq.on('error', (e) => {
+    try { sendJSON(res, 502, { error: assistantFriendlyError(0, e.message) }); } catch (e2) {}
+  });
+  upReq.write(payload);
+  upReq.end();
+}
+
+// ============ 管理面板基础设施（仅本机 + 防 DNS rebinding） ============
+function sendJSON(res, code, obj) {
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(obj));
+}
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let b = '';
+    req.on('data', c => { b += c; if (b.length > 5 * 1024 * 1024) req.destroy(); });
+    req.on('end', () => resolve(b));
+    req.on('error', reject);
+  });
+}
+function adminAllowed(req) {
+  const host = String(req.headers.host || '').toLowerCase();
+  const okHost = [`127.0.0.1:${MY_PORT}`, `localhost:${MY_PORT}`];
+  if (!okHost.includes(host)) return false;
+  const org = req.headers.origin || req.headers.referer || '';
+  if (org && !new RegExp(`^https?://(127\\.0\\.0\\.1|localhost)(:\\d+)?`).test(org)) return false;
+  return true;
+}
+const PUBLIC_DIR = path.join(APP_DIR, 'public');
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+};
+function serveStatic(res, file) {
+  fs.readFile(path.join(PUBLIC_DIR, file), (e, data) => {
+    if (e) { res.writeHead(404); res.end('Not Found'); return; }
+    res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache' });
+    res.end(data);
+  });
+}
+function readRunState() {
+  try { return JSON.parse(fs.readFileSync(path.join(APP_DIR, `run-state-${TAG}.json`), 'utf-8')); } catch (e) { return {}; }
+}
+function allModelsSorted() {
+  return [...new Set(Object.values(PROVIDERS).flatMap(p => [...p.models, ...Object.keys(p.aliases)]))].sort();
+}
+// 实际可用模型：站级（探活通且未被剔除）+ 模型级（未连续失败）双重过滤
+function isProviderUsable(name) {
+  const p = PROVIDERS[name];
+  if (!p || p.enabled === false) return false;
+  if (!isProviderHealthy(name)) return false;
+  const probe = probeState[name];
+  if (!probe || probe.busy) return true; // 未探活/探测中，先乐观列为可用
+  return probe.ok;
+}
+function availableModels() {
+  const models = new Set();
+  for (const [name, p] of Object.entries(PROVIDERS)) {
+    if (!isProviderUsable(name)) continue;
+    for (const m of p.models) if (!isModelUnavailable(m)) models.add(m);
+    for (const a of Object.keys(p.aliases)) if (!isModelUnavailable(a)) models.add(a);
+  }
+  return [...models].sort();
+}
+// ============ 模型稳定性测试（推荐模型由实测动态产生，绝不硬编码） ============
+const VENDORS = {
+  'deepseek': 'DeepSeek', 'glm': '智谱', 'qwen': '通义千问', 'step': '阶跃星辰',
+  'grok': 'xAI', 'hy3': '腾讯混元', 'kimi': '月之暗面', 'minimax': 'MiniMax',
+  'llama': 'Meta', 'gemma': 'Google', 'mistral': 'Mistral', 'sensenova': '星辰',
+};
+function vendorOf(model) {
+  const m = String(model || '').toLowerCase();
+  for (const [k, v] of Object.entries(VENDORS)) if (m.includes(k)) return v;
+  return '';
+}
+// 某模型有多少个健康站能提供（直接 models 或 alias 映射）
+function redundantCount(model) {
+  const m = String(model || '').toLowerCase();
+  let n = 0;
+  for (const [name, p] of Object.entries(PROVIDERS)) {
+    if (!isProviderUsable(name)) continue;
+    if (p.models.some(x => x.toLowerCase() === m)) { n++; continue; }
+    if (Object.keys(p.aliases).some(a => a.toLowerCase() === m)) n++;
+  }
+  return n;
+}
+
+const stability = { running: false, results: {}, lastTest: 0 };
+// 推荐标准（硬）：冗余 ≥ 2 站 且 实测 2 次全通过
+function computeRecommended() {
+  return Object.entries(stability.results)
+    .filter(([, r]) => r.redundant >= 2 && r.ok >= 2 && r.fail === 0)
+    .map(([model, r]) => ({
+      alias: model, vendor: r.vendor, ms: r.ms, redundant: r.redundant,
+      note: `${r.redundant} 站冗余，实测 ${r.ok}/${r.ok + r.fail} 次通过`,
+      available: true,
+    }))
+    .sort((a, b) => b.redundant - a.redundant || a.ms - b.ms);
+}
+
+function testModelOnce(model) {
+  return new Promise((resolve) => {
+    const payload = JSON.stringify({ model, messages: [{ role: 'user', content: '回复ok' }], max_tokens: 16 });
+    const req = http.request({
+      host: '127.0.0.1', port: MY_PORT, path: '/v1/chat/completions', method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${settings.apiKey}`,
+        'Content-Length': Buffer.byteLength(payload),
+      },
+      timeout: 60000,
+    }, (res) => {
+      let data = '';
+      res.on('data', c => { data += c; if (data.length > 50000) req.destroy(); });
+      res.on('end', () => {
+        let ok = false;
+        if (res.statusCode === 200) {
+          try {
+            const j = JSON.parse(data);
+            ok = Array.isArray(j.choices) && j.choices.length > 0 && j.choices[0].message != null;
+          } catch (e) {}
+        }
+        resolve(ok);
+      });
+    });
+    req.on('timeout', () => req.destroy());
+    req.on('error', () => resolve(false));
+    req.write(payload);
+    req.end();
+  });
+}
+
+async function runStabilityTest() {
+  if (stability.running) return;
+  stability.running = true;
+  stability.results = {};
+  // 只测有冗余的候选（单站模型不配进推荐，不浪费请求）
+  const candidates = availableModels().filter(m => redundantCount(m) >= 2);
+  const CONCURRENCY = 4;
+  let idx = 0;
+  async function worker() {
+    while (idx < candidates.length) {
+      const model = candidates[idx++];
+      let ok = 0, fail = 0, msSum = 0;
+      for (let i = 0; i < 2; i++) {
+        const t0 = Date.now();
+        const good = await testModelOnce(model);
+        msSum += Date.now() - t0;
+        good ? ok++ : fail++;
+      }
+      stability.results[model] = {
+        ok, fail, ms: Math.round(msSum / Math.max(1, ok + fail)),
+        redundant: redundantCount(model), vendor: vendorOf(model),
+      };
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, candidates.length) }, worker));
+  stability.running = false;
+  stability.lastTest = Date.now();
+  console.log(`🧪 稳定性测试完成：${candidates.length} 个候选，推荐 ${computeRecommended().length} 个`);
+}
+
+// ============ apply（AI/手动变更应用，批量） ============
+async function handleApply(req, res, body) {
+  let parsed;
+  try { parsed = JSON.parse(body); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+  const ops = Array.isArray(parsed.ops) ? parsed.ops : [];
+  if (ops.length === 0) return sendJSON(res, 400, { error: '缺少操作列表' });
+
+  // 从磁盘读真源（而非内存，避免热加载时序问题）
+  let list;
+  try { list = JSON.parse(fs.readFileSync(configPath, 'utf-8')); } catch (e) {
+    return sendJSON(res, 500, { error: `providers.json 读取失败: ${e.message}` });
+  }
+  const results = [];
+  const applied = [];
+  const appliedNames = [];
+  for (const op of ops) {
+    const action = op.action, np = op.provider || {};
+    const idx = list.findIndex(p => p.name === np.name);
+    if (action === 'add') {
+      if (idx >= 0) { results.push(`${np.name}: 已存在同名站，如需修改请用 update`); continue; }
+      const item = { ...np };
+      if (!item.aliases) item.aliases = {};
+      if (item.enabled === undefined) item.enabled = true;
+      list.push(item);
+      applied.push(`新增 ${np.name}（${(np.models || []).length} 个模型）`);
+      appliedNames.push(np.name);
+    } else if (action === 'update') {
+      if (idx < 0) { results.push(`${np.name || '?'}: 不存在，无法更新`); continue; }
+      const merged = { ...list[idx], ...np };   // 未知字段保留
+      if (!np.key || String(np.key).includes('***')) merged.key = list[idx].key; // key 脱敏/空 = 不变
+      if (np.enabled === true) delete merged.disabledBy; // 重新启用：清除自动踢标记
+      list[idx] = merged;
+      applied.push(`更新 ${np.name}`);
+      appliedNames.push(np.name);
+    } else if (action === 'delete') {
+      if (idx < 0) { results.push(`${np.name || '?'}: 不存在，无法删除`); continue; }
+      list.splice(idx, 1);
+      applied.push(`删除 ${np.name}`);
+      // 同步清理优先级表（防残留死条目）
+      try {
+        const st = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+        if (Array.isArray(st.priority)) {
+          st.priority = st.priority.filter(n => n !== np.name);
+          fs.writeFileSync(settingsPath, JSON.stringify(st, null, 2));
+        }
+      } catch (e) {}
+    } else {
+      results.push(`未知 action: ${action}`);
+    }
+  }
+  if (applied.length === 0) return sendJSON(res, 400, { error: results.join('；') || '没有可应用的操作' });
+
+  const err = writeProviders(list);
+  if (err) return sendJSON(res, 400, { error: err });
+  addChangelog(parsed.source || 'AI', applied.join('；'));
+  // 应用成功 → 清掉对应 stash
+  const names = new Set(ops.map(o => o.provider && o.provider.name).filter(Boolean));
+  memory.stash = memory.stash.filter(s => !names.has(s.name));
+  saveMemory();
+  console.log(`  ✅ 已应用变更（${parsed.source === '手动' ? '手动' : 'AI'}）: ${applied.join('；')}`);
+  // 新站/更新站即时探活：死站当场垫底，不进路由坑人
+  for (const n of appliedNames) {
+    if (PROVIDERS[n]) setTimeout(() => { probeOne(n).catch(() => {}); }, 1500);
+  }
+  sendJSON(res, 200, { ok: true, applied, skipped: results });
+}
+
+// ============ 管理路由分发 ============
+async function handleAdmin(req, res, reqUrl) {
+  const p = reqUrl.pathname;
+  const m = req.method;
+
+  if (m === 'GET' && p === '/admin/api/status') {
+    const providers = Object.entries(PROVIDERS).map(([name, cfg]) => ({
+      name, baseUrl: cfg.baseUrl, keyMasked: maskKey(cfg.key), models: cfg.models,
+      aliases: cfg.aliases, enabled: cfg.enabled !== false,
+      disabledBy: (providerList.find(x => x.name === name) || {}).disabledBy || null,
+      score: providerScores[name] || null,
+      failures: providerHealth[name] ? providerHealth[name].failures : 0,
+      quarantined: providerHealth[name] ? !isProviderHealthy(name) : false,
+      probe: probeState[name] || null,
+      availableModels: [...new Set([...cfg.models, ...Object.keys(cfg.aliases)])].filter(m => !isModelUnavailable(m)),
+    }));
+    const a = settings.assistant || {};
+    sendJSON(res, 200, {
+      port: MY_PORT,
+      uptime: Math.floor((Date.now() - startedAt) / 1000),
+      models: availableModels(),
+      recommended: computeRecommended(),
+      kickedCount: providerList.filter(p => p.disabledBy === 'auto').length,
+      providers,
+      runState: readRunState(),
+      baseUrl: `http://${HOST}:${MY_PORT}/v1`,
+      apiKeyMasked: maskKey(settings.apiKey),
+      assistant: { baseUrl: a.baseUrl, keyMasked: maskKey(a.key), model: a.model || '' },
+      probeIntervalMin: settings.probeIntervalMin,
+    });
+    return;
+  }
+
+  if (m === 'GET' && p === '/admin/api/providers') {
+    sendJSON(res, 200, { mtime: configMtime(), list: providerList.map(maskProvider) });
+    return;
+  }
+  if (m === 'PUT' && p === '/admin/api/providers') {
+    const body = await readBody(req);
+    let parsed;
+    try { parsed = JSON.parse(body); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    if (parsed.mtime && parsed.mtime < configMtime()) {
+      return sendJSON(res, 409, { error: '配置已被其他页面修改，请刷新后重试' });
+    }
+    const oldByName = {};
+    for (const op of providerList) oldByName[op.name] = op;
+    const list = (parsed.list || []).map(np => {
+      const old = oldByName[np.name];
+      const merged = { ...old, ...np };   // 未知字段保留
+      if (!np.key || String(np.key).includes('***')) merged.key = old ? old.key : '';
+      // 手动启停标记：手动停用=manual（一键清理不删）；手动启用清除标记（恢复参与自动判定）
+      if (old && old.enabled !== false && np.enabled === false) merged.disabledBy = 'manual';
+      if (old && old.enabled === false && np.enabled === true) delete merged.disabledBy;
+      return merged;
+    });
+    const err = writeProviders(list);
+    if (err) return sendJSON(res, 400, { error: err });
+    addChangelog('手动', '保存 provider 配置');
+    sendJSON(res, 200, { ok: true });
+    return;
+  }
+
+  if (m === 'GET' && p === '/admin/api/settings') {
+    const s = { ...settings, assistant: { ...(settings.assistant || {}) } };
+    s.apiKey = maskKey(settings.apiKey);
+    if (s.assistant) s.assistant.key = maskKey(settings.assistant.key);
+    sendJSON(res, 200, s);
+    return;
+  }
+  if (m === 'PUT' && p === '/admin/api/settings') {
+    const body = await readBody(req);
+    let fresh;
+    try { fresh = JSON.parse(body); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const old = JSON.parse(JSON.stringify(settings));
+    // key 类字段：空或含 *** → 保留旧值
+    if (!fresh.apiKey || String(fresh.apiKey).includes('***')) fresh.apiKey = old.apiKey;
+    if (fresh.assistant) {
+      if (!fresh.assistant.key || String(fresh.assistant.key).includes('***')) {
+        fresh.assistant.key = (old.assistant && old.assistant.key) || '';
+      }
+      fresh.assistant = { ...old.assistant, ...fresh.assistant };
+    }
+    const merged = { ...old, ...fresh };
+    try { atomicWrite(settingsPath, JSON.stringify(merged, null, 2)); } catch (e) {
+      return sendJSON(res, 500, { error: `写入失败: ${e.message}` });
+    }
+    const changedKey = fresh.apiKey !== old.apiKey;
+    sendJSON(res, 200, { ok: true, changedKey });
+    return;
+  }
+
+  if (p === '/admin/api/memory') {
+    if (m === 'GET') { sendJSON(res, 200, memory); return; }
+    if (m === 'PUT') {
+      const body = await readBody(req);
+      let op;
+      try { op = JSON.parse(body); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      if (op.op === 'addPreference' && op.text) memory.preferences.push(String(op.text));
+      else if (op.op === 'editPreference' && Number.isInteger(op.index) && op.text) memory.preferences[op.index] = String(op.text);
+      else if (op.op === 'delPreference' && Number.isInteger(op.index)) memory.preferences.splice(op.index, 1);
+      else if (op.op === 'delStash' && Number.isInteger(op.index)) memory.stash.splice(op.index, 1);
+      else if (op.op === 'addStash' && op.item) memory.stash.push(op.item);
+      else if (op.op === 'clearAll') memory = { changelog: [], stash: [], preferences: [] };
+      else return sendJSON(res, 400, { error: '未知操作' });
+      saveMemory();
+      sendJSON(res, 200, memory);
+      return;
+    }
+    sendJSON(res, 405, { error: 'Method Not Allowed' });
+    return;
+  }
+
+  if (m === 'POST' && p === '/admin/api/test') {
+    const body = await readBody(req);
+    let { name } = {};
+    try { ({ name } = JSON.parse(body)); } catch (e) {}
+    const p2 = PROVIDERS[name];
+    if (!p2) return sendJSON(res, 404, { error: `站 ${name} 不存在` });
+    const t0 = Date.now();
+    const r = await sniffModels(p2.baseUrl, p2.key);
+    sendJSON(res, 200, { name, ok: r.ok, ms: Date.now() - t0, status: r.ok ? 200 : 0, err: r.ok ? '' : r.err });
+    return;
+  }
+
+  if (m === 'POST' && p === '/admin/api/probe') {
+    const body = await readBody(req);
+    let name = 'all';
+    try { ({ name = 'all' } = JSON.parse(body)); } catch (e) {}
+    if (name === 'all') {
+      runProbeAll();
+      sendJSON(res, 200, { started: 'all' });
+    } else {
+      await probeOne(name);
+      sendJSON(res, 200, probeState[name] || { err: '站不存在' });
+    }
+    return;
+  }
+
+  if (m === 'POST' && p === '/admin/api/probe-models') {
+    const body = await readBody(req);
+    let { baseUrl, key, name } = {};
+    try { ({ baseUrl, key, name } = JSON.parse(body)); } catch (e) {}
+    // key 留空且指定了已有站 → 用已保存的 key（方便编辑表单自动拉模型）
+    if (!key && name && PROVIDERS[name] && PROVIDERS[name].baseUrl === baseUrl) {
+      key = PROVIDERS[name].key;
+    }
+    if (!baseUrl) return sendJSON(res, 400, { error: '缺少 baseUrl' });
+    if (!key) return sendJSON(res, 400, { error: '缺少 key（新站请填写，已有站可留空自动使用保存的 key）' });
+    const r = await sniffModels(baseUrl, key);
+    sendJSON(res, r.ok ? 200 : 400, r);
+    return;
+  }
+
+  if (p === '/admin/api/stability-test') {
+    if (m === 'POST') {
+      if (stability.running) return sendJSON(res, 200, { running: true });
+      runStabilityTest().catch(e => { console.log('稳定性测试出错:', e.message); stability.running = false; });
+      return sendJSON(res, 200, { running: true });
+    }
+    if (m === 'GET') {
+      return sendJSON(res, 200, { running: stability.running, lastTest: stability.lastTest, results: stability.results, recommended: computeRecommended() });
+    }
+  }
+
+  if (m === 'POST' && p === '/admin/api/priority') {
+    const body = await readBody(req);
+    let { name, action } = {};
+    try { ({ name, action } = JSON.parse(body)); } catch (e) {}
+    if (!name || !['up', 'down', 'top', 'bottom'].includes(action)) {
+      return sendJSON(res, 400, { error: '需要 name 和 action（up/down/top/bottom）' });
+    }
+    try {
+      const st = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+      let prio = Array.isArray(st.priority) ? [...st.priority] : [];
+      let i = prio.indexOf(name);
+      if (i < 0) { prio.push(name); i = prio.length - 1; }
+      prio.splice(i, 1);
+      if (action === 'top') prio.unshift(name);
+      else if (action === 'bottom') prio.push(name);
+      else if (action === 'up') prio.splice(Math.max(0, i - 1), 0, name);
+      else if (action === 'down') prio.splice(Math.min(prio.length, i + 1), 0, name);
+      st.priority = prio;
+      atomicWrite(settingsPath, JSON.stringify(st, null, 2));
+      addChangelog('AI', `调整优先级：${name} → ${action}`);
+      console.log(`  ✅ 调整优先级（AI）: ${name} ${action}`);
+      sendJSON(res, 200, { ok: true, priority: prio });
+    } catch (e) {
+      sendJSON(res, 500, { error: e.message });
+    }
+    return;
+  }
+
+  if (m === 'POST' && p === '/admin/api/toggle-provider') {
+    const body = await readBody(req);
+    let { name, enabled } = {};
+    try { ({ name, enabled } = JSON.parse(body)); } catch (e) {}
+    if (!name || typeof enabled !== 'boolean') return sendJSON(res, 400, { error: '需要 name 和 enabled（布尔）' });
+    try {
+      const list = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      const item = list.find(x => x.name === name);
+      if (!item) return sendJSON(res, 404, { error: `站 ${name} 不存在` });
+      item.enabled = enabled;
+      const err = writeProviders(list);
+      if (err) return sendJSON(res, 400, { error: err });
+      addChangelog('AI', `${enabled ? '启用' : '停用'} ${name}`);
+      console.log(`  ✅ ${enabled ? '启用' : '停用'} ${name}（AI）`);
+      sendJSON(res, 200, { ok: true });
+    } catch (e) {
+      sendJSON(res, 500, { error: e.message });
+    }
+    return;
+  }
+
+  if (m === 'GET' && p === '/admin/api/stats') {
+    const range = reqUrl.searchParams.get('range') || 'all';
+    sendJSON(res, 200, { ...summarizeStats(range), history: reqHistory.slice(-100).reverse() });
+    return;
+  }
+
+  if (m === 'GET' && p === '/admin/api/logs') {
+    const cursor = parseInt(reqUrl.searchParams.get('cursor') || '0', 10);
+    const items = cursor > 0 ? logRing.filter(l => l.c > cursor) : logRing.slice(-200);
+    sendJSON(res, 200, { cursor: logSeq, items });
+    return;
+  }
+
+  if (m === 'POST' && p === '/admin/api/apply') {
+    const body = await readBody(req);
+    return handleApply(req, res, body);
+  }
+
+  if (m === 'POST' && p === '/admin/api/assistant') {
+    const body = await readBody(req);
+    return handleAssistant(req, res, body);
+  }
+
+  sendJSON(res, 404, { error: 'Not Found' });
+}
+
+// ============ supervisor 心跳检测（supervisor 死亡则自杀，防残留占端口） ============
+const heartbeatFile = path.join(APP_DIR, `heartbeat-${TAG}.txt`);
+setInterval(() => {
+  try {
+    const beat = parseInt(fs.readFileSync(heartbeatFile, 'utf-8').trim(), 10);
+    if (Date.now() - beat > 30000) {
+      console.log('supervisor 心跳超时，router 自动退出');
+      process.exit(0);
+    }
+  } catch (e) { /* 心跳文件不存在（单独调试模式），不退出 */ }
+}, 10000).unref();
+
+// ============ HTTP 代理主服务 ============
+let clientSeq = 0;
+const server = http.createServer((req, res) => {
+  const reqUrl = new URL(req.url, `http://${HOST}:${MY_PORT}`);
+  const reqPath = reqUrl.pathname;
+  const method = req.method;
+
+  // 管理面板请求不打业务日志（轮询会刷屏）
+  if (!reqPath.startsWith('/admin/')) {
+    console.log(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] ${method} ${reqPath}`);
+  }
+
+  // ---- 静态管理页 ----
+  if (method === 'GET' && (reqPath === '/' || reqPath === '/index.html')) { serveStatic(res, 'index.html'); return; }
+  if (method === 'GET' && (reqPath === '/app.js' || reqPath === '/style.css')) { serveStatic(res, reqPath.slice(1)); return; }
+
+  // ---- 管理 API（仅本机） ----
+  if (reqPath.startsWith('/admin/')) {
+    if (!adminAllowed(req)) { sendJSON(res, 403, { error: '禁止访问' }); return; }
+    handleAdmin(req, res, reqUrl).catch(e => {
+      try { sendJSON(res, 500, { error: e.message }); } catch (e2) {}
+    });
+    return;
+  }
+
+  if (method !== 'POST' && method !== 'GET') {
+    res.writeHead(405);
+    res.end('Method Not Allowed');
+    return;
+  }
+
+  if (method === 'GET' && reqPath === '/v1/models') {
+    const auth = req.headers.authorization || '';
+    if (settings.apiKey && auth !== `Bearer ${settings.apiKey}`) {
+      return sendJSON(res, 401, { error: { message: 'API Key 无效', type: 'auth_error' } });
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      object: 'list',
+      data: availableModels().map(m2 => ({ id: m2, object: 'model' }))
+    }));
+    return;
+  }
+
+  if (!reqPath.startsWith('/v1/')) {
+    res.writeHead(404);
+    res.end('Not Found');
+    return;
+  }
+
+  // apiKey 校验（默认 sk-router 与现有客户端一致）
+  const auth = req.headers.authorization || '';
+  if (settings.apiKey && auth !== `Bearer ${settings.apiKey}`) {
+    return sendJSON(res, 401, { error: { message: 'API Key 无效（在管理面板「设置」中配置）', type: 'auth_error' } });
+  }
+
+  // Anthropic 端点统一转成 OpenAI chat/completions
+  let upstreamPath = reqPath;
+  if (reqPath === '/v1/messages' || reqPath === '/v1/input_messages') {
+    upstreamPath = '/v1/chat/completions';
+  }
+
+  let body = '';
+  req.on('data', chunk => { body += chunk; });
+  req.on('end', async () => {
+    let parsed;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      res.writeHead(400);
+      res.end('Invalid JSON');
+      return;
+    }
+
+    const modelName = parsed.model || '';
+    const clientId = ++clientSeq;
+    const candidates = sortCandidates(findProviders(modelName)).filter(c => isProviderHealthy(c.provider));
+    const tryList = candidates.length > 0 ? candidates : sortCandidates(findProviders(modelName));
+
+    if (tryList.length === 0) {
+      const available = availableModels();
+      const preview = available.slice(0, 20).join(', ') + (available.length > 20 ? ` …（共 ${available.length} 个）` : '');
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        error: {
+          message: `模型 "${modelName}" 未找到。可用: ${preview}`,
+          type: 'model_not_found',
+        }
+      }));
+      recordClientResult(false);
+      return;
+    }
+
+    let lastError = null;
+
+    for (const cand of tryList) {
+      const targetBody = JSON.stringify(sanitizeBody(parsed, cand.realModel));
+      const opts = buildOptions(cand, upstreamPath, targetBody);
+      const aliasNote = cand.realModel !== modelName ? ` (${modelName} → ${cand.realModel})` : '';
+      console.log(`  → ${cand.provider} ${opts.hostname}${opts.path}${aliasNote}`);
+
+      const t0 = Date.now();
+      let result;
+      try {
+        result = await sendRequest(opts, targetBody);
+      } catch (e) {
+        markProviderFailed(cand.provider);
+        console.log(`  ✗ ${cand.provider} 网络错误: ${e.message}`);
+        recordAttempt(modelName, cand.provider, Date.now() - t0, 502, false, false, null);
+        lastError = { statusCode: 502, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: { message: `${cand.provider}: ${e.message}`, type: 'proxy_error' } }) };
+        continue;
+      }
+
+      if (result.stream) {
+        markProviderSuccess(cand.provider);
+        markModelSuccess(modelName);
+        console.log(`  ✅ ${cand.provider} [stream] model=${modelName}`);
+        recordAttempt(modelName, cand.provider, Date.now() - t0, 200, true, true, null);
+        recordClientResult(true);
+        res.writeHead(result.statusCode, result.headers);
+        const stream = result.stream;
+        // 尽力解析流式 usage（最后一个带 usage 的 chunk）
+        let usageTail = '';
+        let usageDone = false;
+        stream.on('data', (chunk) => {
+          if (usageDone) return;
+          usageTail = (usageTail + chunk.toString('utf8')).slice(-65536);
+          const m = usageTail.match(/"usage"\s*:\s*\{[^{}]*\}/g);
+          if (m) {
+            try {
+              const u = JSON.parse(`{${m[m.length - 1]}}`).usage || JSON.parse(m[m.length - 1]);
+              if (u && (u.prompt_tokens || u.completion_tokens)) {
+                recordStreamTokens(cand.provider, modelName, u);
+                usageDone = true;
+              }
+            } catch (e) {}
+          }
+        });
+        stream.pipe(res);
+        // 客户端断开 → 销毁上游连接（修复连接泄漏挤爆连接池的问题）
+        res.on('close', () => { if (!stream.destroyed) stream.destroy(); });
+        return;
+      }
+
+      let usage = null;
+      if (result.statusCode >= 200 && result.statusCode < 300) {
+        try { usage = (JSON.parse(result.body).usage) || null; } catch (e) {}
+      }
+      recordAttempt(modelName, cand.provider, Date.now() - t0, result.statusCode, result.statusCode >= 200 && result.statusCode < 300 && isValidCompletion(result.body), false, usage);
+
+      if (result.statusCode >= 200 && result.statusCode < 300) {
+        if (!isValidCompletion(result.body)) {
+          markProviderFailed(cand.provider);
+          markModelFailed(modelName);
+          console.log(`  🔄 ${cand.provider} [200但空响应] 换下一个provider...`);
+          lastError = result;
+          continue;
+        }
+        markProviderSuccess(cand.provider);
+        markModelSuccess(modelName);
+        console.log(`  ✅ ${cand.provider} [${result.statusCode}] model=${modelName}`);
+        res.writeHead(result.statusCode, result.headers);
+        res.end(result.body);
+        recordClientResult(true);
+        return;
+      }
+
+      if (shouldFailover(result.statusCode, result.body)) {
+        markProviderFailed(cand.provider);
+        if (isModelLevelError(result.statusCode, result.body, isValidCompletion(result.body))) {
+          markModelFailed(modelName);
+        }
+        console.log(`  🔄 ${cand.provider} [${result.statusCode}] 换下一个provider...`);
+        lastError = result;
+        continue;
+      }
+
+      console.log(`  ⚠️ ${cand.provider} [${result.statusCode}] 不可转移错误，原样返回`);
+      res.writeHead(result.statusCode, result.headers);
+      res.end(result.body);
+      recordClientResult(result.statusCode < 500);
+      return;
+    }
+
+    console.log(`  💥 所有provider都失败 (尝试了${tryList.length}个)`);
+    recordClientResult(false);
+    if (lastError) {
+      res.writeHead(lastError.statusCode, lastError.headers);
+      res.end(lastError.body);
+    } else {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'all providers failed', type: 'proxy_error' } }));
+    }
+  });
+});
+
+server.listen(MY_PORT, HOST, () => {
+  console.log(`\n✅ 路由代理已启动（故障转移 + 流式支持 + 管理面板）`);
+  console.log(`   接口地址: http://${HOST}:${MY_PORT}/v1`);
+  console.log(`   管理面板: http://${HOST}:${MY_PORT}/`);
+  console.log(`   API Key: ${maskKey(settings.apiKey)}（settings.json 可改）`);
+  console.log(`   配置文件: ${configPath}`);
+  console.log(`\n📋 已加载 ${providerList.length} 个 provider:`);
+  for (const p of providerList) {
+    console.log(`   ${p.name}: ${p.baseUrl} (${p.models.length} 个模型)`);
+  }
+  console.log(`\n📦 去重后配置模型 ${allModelsSorted().length} 个，当前可用 ${availableModels().length} 个`);
+  scheduleProbe();
+  setTimeout(runProbeAll, 3000); // 启动 3 秒后先探活一轮
+  // 探活完成后自动测稳定性（每次启动/重启都会自动跑，推荐模型自动更新，无需手动）
+  setTimeout(() => {
+    runStabilityTest().catch(e => console.log('自动稳定性测试出错:', e.message));
+  }, 15000);
+});
