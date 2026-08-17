@@ -218,6 +218,8 @@ function sanitizeBody(parsed, realModel) {
   out.messages = messages;
 
   if (typeof parsed.stream === 'boolean') out.stream = parsed.stream;
+  // 请求流式 usage（token 统计依赖：OpenAI 标准，不兼容的站会忽略该字段）
+  if (out.stream === true) out.stream_options = { include_usage: true };
   if (parsed.temperature !== undefined) out.temperature = parsed.temperature;
   if (parsed.top_p !== undefined) out.top_p = parsed.top_p;
   if (typeof parsed.stop === 'string' || Array.isArray(parsed.stop)) out.stop = parsed.stop;
@@ -415,17 +417,23 @@ function todayBucket() {
   return stats[k];
 }
 function ensureCell(map, name) {
-  if (!map[name]) map[name] = { reqs: 0, ok: 0, fail: 0, ms: 0, tin: 0, tout: 0 };
+  if (!map[name]) map[name] = { reqs: 0, ok: 0, fail: 0, ms: 0, tin: 0, tout: 0, cached: 0 };
   return map[name];
+}
+// 从 usage 提取缓存命中 token（OpenAI 标准字段，部分站不返回）
+function cachedTokens(usage) {
+  try {
+    return (usage && usage.prompt_tokens_details && usage.prompt_tokens_details.cached_tokens) || 0;
+  } catch (e) { return 0; }
 }
 function recordAttempt(model, provider, ms, code, ok, stream, usage) {
   const b = todayBucket();
   const p = ensureCell(b.byProvider, provider);
   p.reqs++; ok ? p.ok++ : p.fail++; p.ms += ms;
-  if (usage) { p.tin += usage.prompt_tokens || 0; p.tout += usage.completion_tokens || 0; }
+  if (usage) { p.tin += usage.prompt_tokens || 0; p.tout += usage.completion_tokens || 0; p.cached += cachedTokens(usage); }
   const m = ensureCell(b.byModel, model);
   m.reqs++; ok ? m.ok++ : m.fail++; m.ms += ms;
-  if (usage) { m.tin += usage.prompt_tokens || 0; m.tout += usage.completion_tokens || 0; }
+  if (usage) { m.tin += usage.prompt_tokens || 0; m.tout += usage.completion_tokens || 0; m.cached += cachedTokens(usage); }
   reqHistory.push({ t: Date.now(), model, provider, ms: Math.round(ms), code, ok, stream: !!stream });
   if (reqHistory.length > 200) reqHistory.splice(0, reqHistory.length - 200);
   computeProviderScore(provider); // 评分随请求实时更新
@@ -441,9 +449,9 @@ function recordStreamTokens(provider, model, usage) {
   if (!usage) return;
   const b = todayBucket();
   const p = ensureCell(b.byProvider, provider);
-  p.tin += usage.prompt_tokens || 0; p.tout += usage.completion_tokens || 0;
+  p.tin += usage.prompt_tokens || 0; p.tout += usage.completion_tokens || 0; p.cached += cachedTokens(usage);
   const m = ensureCell(b.byModel, model);
-  m.tin += usage.prompt_tokens || 0; m.tout += usage.completion_tokens || 0;
+  m.tin += usage.prompt_tokens || 0; m.tout += usage.completion_tokens || 0; m.cached += cachedTokens(usage);
   scheduleStatsSave();
 }
 let statsTimer = null;
@@ -1358,36 +1366,56 @@ const server = http.createServer((req, res) => {
         continue;
       }
 
-      if (result.stream) {
-        markProviderSuccess(cand.provider);
-        markModelSuccess(modelName);
-        console.log(`  ✅ ${cand.provider} [stream] model=${modelName}`);
-        recordAttempt(modelName, cand.provider, Date.now() - t0, 200, true, true, null);
-        recordClientResult(true);
-        res.writeHead(result.statusCode, result.headers);
-        const stream = result.stream;
-        // 尽力解析流式 usage（最后一个带 usage 的 chunk）
-        let usageTail = '';
-        let usageDone = false;
-        stream.on('data', (chunk) => {
-          if (usageDone) return;
-          usageTail = (usageTail + chunk.toString('utf8')).slice(-65536);
-          const m = usageTail.match(/"usage"\s*:\s*\{[^{}]*\}/g);
-          if (m) {
-            try {
-              const u = JSON.parse(`{${m[m.length - 1]}}`).usage || JSON.parse(m[m.length - 1]);
-              if (u && (u.prompt_tokens || u.completion_tokens)) {
-                recordStreamTokens(cand.provider, modelName, u);
-                usageDone = true;
-              }
-            } catch (e) {}
+  if (result.stream) {
+    markProviderSuccess(cand.provider);
+    markModelSuccess(modelName);
+    console.log(`  ✅ ${cand.provider} [stream] model=${modelName}`);
+    recordClientResult(true);
+    res.writeHead(result.statusCode, result.headers);
+    const stream = result.stream;
+    // 流式 usage 解析：从尾部找最后一个可解析的 "usage" 对象（兼容嵌套与 usage:null 干扰）
+    let usageTail = '';
+    let usageDone = false;
+    stream.on('data', (chunk) => {
+      if (usageDone) return;
+      usageTail = (usageTail + chunk.toString('utf8')).slice(-65536);
+      // 从后往前遍历所有 "usage" 位置，跳过 null/失败项，取第一个能解析出真实 tokens 的
+      let searchFrom = usageTail.length;
+      while (!usageDone) {
+        const idx = usageTail.lastIndexOf('"usage"', searchFrom);
+        if (idx < 0) break;
+        searchFrom = idx - 1;
+        const start = usageTail.indexOf('{', idx);
+        if (start < 0) continue;
+        let depth = 0, end = -1;
+        for (let i = start; i < usageTail.length; i++) {
+          if (usageTail[i] === '{') depth++;
+          else if (usageTail[i] === '}') { depth--; if (depth === 0) { end = i + 1; break; } }
+        }
+        if (end <= 0) continue;
+        try {
+          const u = JSON.parse(usageTail.slice(start, end));
+          if (u && (u.prompt_tokens || u.completion_tokens)) {
+            recordStreamTokens(cand.provider, modelName, u);
+            usageDone = true;
           }
-        });
-        stream.pipe(res);
-        // 客户端断开 → 销毁上游连接（修复连接泄漏挤爆连接池的问题）
-        res.on('close', () => { if (!stream.destroyed) stream.destroy(); });
-        return;
+        } catch (e) {}
       }
+    });
+    // 流式延迟 = 完整流式时长（end 或客户端断开 close 都记录，只记一次）
+    let streamRecorded = false;
+    const recordStream = () => {
+      if (streamRecorded) return;
+      streamRecorded = true;
+      recordAttempt(modelName, cand.provider, Date.now() - t0, 200, true, true, null);
+    };
+    stream.on('end', recordStream);
+    stream.on('close', recordStream);
+    stream.pipe(res);
+    // 客户端断开 → 销毁上游连接（修复连接泄漏挤爆连接池的问题）
+    res.on('close', () => { if (!stream.destroyed) stream.destroy(); });
+    return;
+  }
 
       let usage = null;
       if (result.statusCode >= 200 && result.statusCode < 300) {
