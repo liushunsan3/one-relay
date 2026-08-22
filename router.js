@@ -1,4 +1,4 @@
-/**
+﻿/**
  * OpenAI 兼容路由代理（故障转移 + 流式 + Web 管理面板）
  * 由 supervisor.js 看护启动；也可单独 node router.js 调试（此时不做心跳自杀）
  * 业务核心：多 provider 路由、别名映射、速度优先级、自动故障转移、SSE 透传
@@ -16,6 +16,14 @@ const MY_PORT = parseInt(process.env.RP_PORT || '3099', 10);
 const HOST = '127.0.0.1';
 const UPSTREAM_TIMEOUT = 60000;
 const startedAt = Date.now();
+
+// 全局未捕获异常处理：防止任何遗漏的 Promise rejection 导致进程退出（Node 15+ 默认行为）
+process.on('unhandledRejection', (reason) => {
+  console.log(`⚠️ 未捕获的 Promise rejection: ${reason instanceof Error ? reason.message : reason}`);
+});
+process.on('uncaughtException', (err) => {
+  console.log(`⚠️ 未捕获的同步异常: ${err.message}`);
+});
 
 // ============ 日志环形缓冲（管理面板增量拉取） ============
 const LOG_RING_MAX = 1000;
@@ -78,7 +86,7 @@ fs.watchFile(settingsPath, { interval: 1000 }, () => {
       const fresh = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
       settings = { ...settings, ...fresh };
       scheduleProbe();
-      console.log(`\n⚙️ [${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] settings 已热加载: apiKey=*** 优先级=${(settings.priority || []).length} 项\n`);
+      console.log(`\n⚙️ settings 已热加载: apiKey=*** 优先级=${(settings.priority || []).length} 项\n`);
     } catch (e) {
       console.log(`\n❌ settings 热加载失败（保留旧配置）: ${e.message}\n`);
     }
@@ -108,9 +116,9 @@ fs.watchFile(configPath, { interval: 1000 }, () => {
       for (const n of Object.keys(probeState)) if (!names.has(n)) delete probeState[n];
       for (const n of Object.keys(PROVIDERS)) computeProviderScore(n); // 配置变化后评分全量重算
       const allModels = [...new Set(Object.values(PROVIDERS).flatMap(p => [...p.models, ...Object.keys(p.aliases)]))];
-      console.log(`\n🔄 [${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 配置已热加载: ${fresh.length} 个 provider, ${allModels.length} 个模型\n`);
+      console.log(`\n🔄 配置已热加载: ${fresh.length} 个 provider, ${allModels.length} 个模型\n`);
     } catch (e) {
-      console.log(`\n❌ [${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 热加载失败（保留旧配置）: ${e.message}\n`);
+      console.log(`\n❌ 热加载失败（保留旧配置）: ${e.message}\n`);
     }
   }, 2000);
 });
@@ -405,6 +413,21 @@ try {
   const saved = JSON.parse(fs.readFileSync(statsPath, 'utf-8'));
   stats = saved.stats || {};
   reqHistory = saved.history || [];
+  // 历史数据归一：旧版本 byModel 分桶大小写不敏感缺失，同一模型出现过大小写不同的双行，合并到小写 key
+  for (const day of Object.values(stats)) {
+    if (!day || !day.byModel) continue;
+    for (const k of Object.keys(day.byModel)) {
+      const lk = k.toLowerCase();
+      if (k === lk) continue;
+      const target = day.byModel[lk] || (day.byModel[lk] = day.byModel[k]);
+      const s = day.byModel[k];
+      if (target !== s) {
+        target.reqs += s.reqs; target.ok += s.ok; target.fail += s.fail; target.ms += s.ms;
+        target.tin += s.tin; target.tout += s.tout; target.cached += s.cached;
+      }
+      delete day.byModel[k];
+    }
+  }
 } catch (e) { /* 首次运行 */ }
 
 function todayKey() {
@@ -431,7 +454,7 @@ function recordAttempt(model, provider, ms, code, ok, stream, usage) {
   const p = ensureCell(b.byProvider, provider);
   p.reqs++; ok ? p.ok++ : p.fail++; p.ms += ms;
   if (usage) { p.tin += usage.prompt_tokens || 0; p.tout += usage.completion_tokens || 0; p.cached += cachedTokens(usage); }
-  const m = ensureCell(b.byModel, model);
+  const m = ensureCell(b.byModel, String(model || 'unknown').toLowerCase()); // 小写归一，避免大小写不同拆成两个桶
   m.reqs++; ok ? m.ok++ : m.fail++; m.ms += ms;
   if (usage) { m.tin += usage.prompt_tokens || 0; m.tout += usage.completion_tokens || 0; m.cached += cachedTokens(usage); }
   reqHistory.push({ t: Date.now(), model, provider, ms: Math.round(ms), code, ok, stream: !!stream });
@@ -450,7 +473,7 @@ function recordStreamTokens(provider, model, usage) {
   const b = todayBucket();
   const p = ensureCell(b.byProvider, provider);
   p.tin += usage.prompt_tokens || 0; p.tout += usage.completion_tokens || 0; p.cached += cachedTokens(usage);
-  const m = ensureCell(b.byModel, model);
+  const m = ensureCell(b.byModel, String(model || 'unknown').toLowerCase()); // 小写归一，与 recordAttempt 同桶
   m.tin += usage.prompt_tokens || 0; m.tout += usage.completion_tokens || 0; m.cached += cachedTokens(usage);
   scheduleStatsSave();
 }
@@ -600,10 +623,16 @@ async function sniffModels(rawBase, key) {
 
 // ============ 记忆库（自愈） ============
 const memoryPath = path.join(APP_DIR, 'memory.json');
-let memory = { changelog: [], stash: [], preferences: [] };
+let memory = { changelog: [], stash: [], preferences: [], diary: [], longterm: [] };
 try {
   const m = JSON.parse(fs.readFileSync(memoryPath, 'utf-8'));
-  memory = { changelog: m.changelog || [], stash: m.stash || [], preferences: m.preferences || [] };
+  memory = {
+    changelog: m.changelog || [],
+    stash: m.stash || [],
+    preferences: m.preferences || [],
+    diary: m.diary || [],
+    longterm: m.longterm || [],
+  };
 } catch (e) {
   try { fs.renameSync(memoryPath, `${memoryPath}.broken-${Date.now()}`); } catch (e2) {}
   console.log('memory.json 损坏已隔离，重建空记忆库');
@@ -611,6 +640,8 @@ try {
 function saveMemory() {
   if (memory.changelog.length > 200) memory.changelog.splice(0, memory.changelog.length - 200);
   if (memory.stash.length > 20) memory.stash.splice(0, memory.stash.length - 20);
+  if (memory.diary.length > 100) memory.diary.splice(0, memory.diary.length - 100);
+  if (memory.longterm.length > 50) memory.longterm.splice(0, memory.longterm.length - 50);
   try { atomicWrite(memoryPath, JSON.stringify(memory, null, 2)); } catch (e) {}
 }
 function addChangelog(source, detail) {
@@ -685,8 +716,9 @@ const ASSISTANT_SYSTEM = `你是「中转站配置助手」，服务于运行在
 - 每轮最多保存一条记忆
 
 ## 可用工具
-当用户要求执行以下操作时，先简要说明你准备做什么，再在回复末尾单独一行输出对应的工具块（系统会执行并把结果回传给你，你再据此用中文总结）。工具块必须单独成行：
-- 测试模型稳定性（找出真正稳定的模型）：{"tool":"stability-test"}
+只有当用户明确要求执行操作（检测/查询/测试/调整/启停等）时才调用工具；普通问题直接用文字回答，不要为了"显得有用"而主动调用工具。
+调用时：先一句话说明要做什么，再在回复末尾单独一行输出工具块（系统执行后把结果回传，你再据此总结）。工具块必须单独成行：
+- 查询模型的配置情况（type: model 查该模型配置在哪些站、别名映射；site 查站点连通；target 填站名或模型名。注意：只查配置和探活结果，不发测试对话，禁止向用户声称"实测"）：{"tool":"check","type":"model","target":"glm-5.2"}
 - 查看服务状态（哪些站挂了、可用/推荐模型、重启次数）：{"tool":"status"}
 - 探测全部站点连通性：{"tool":"probe"}
 - 测试单个站（需指定站名）：{"tool":"test","name":"站名"}
@@ -697,8 +729,8 @@ const ASSISTANT_SYSTEM = `你是「中转站配置助手」，服务于运行在
 其他情况不要输出工具块。
 
 ## 行为规范
-- 与配置无关的请求：一句话说明职责后拒绝，不闲聊
-- 回答用中文，简洁直接，不确定就追问`;
+- 配置、运维、检测相关任务优先完成；对无关话题简短友好地回应即可，不必生硬拒绝
+- 回答用中文，自然简洁，不确定就追问`;
 
 function configSummary() {
   const lines = [];
@@ -711,6 +743,12 @@ function configSummary() {
 }
 function memorySummary() {
   let s = '';
+  if (memory.longterm.length) {
+    s += '### 长期记忆（海马体）\n' + memory.longterm.slice(-20).map(x => `- [${x.category || '事实'}] ${x.fact}`).join('\n') + '\n';
+  }
+  if (memory.diary.length) {
+    s += '### 近期日记\n' + memory.diary.slice(-5).map(d => `- ${d.time} ${d.summary}`).join('\n') + '\n';
+  }
   if (memory.preferences.length) s += '### 用户偏好\n' + memory.preferences.map(x => `- ${x}`).join('\n') + '\n';
   if (memory.changelog.length) s += '### 最近变更历史\n' + memory.changelog.slice(-10).map(c => `- ${c.time} [${c.source}] ${c.detail}`).join('\n') + '\n';
   if (memory.stash.length) s += '### 未应用的暂存资源（可提醒用户处理）\n' + memory.stash.map(x => `- ${x.time} ${x.summary}`).join('\n');
@@ -777,6 +815,114 @@ function handleAssistant(req, res, body) {
   });
   upReq.write(payload);
   upReq.end();
+}
+
+// ============ 海马体记忆巩固 ============
+const CONSOLIDATE_SYSTEM = `你是记忆巩固器（海马体）。把用户与助手的对话总结成日记，并提取值得长期记住的信息。只输出 JSON，不要任何其他文字或解释：
+
+{"diary":{"summary":"一句话总结这次对话做了什么","keypoints":["最多3个要点"]},"longterm":[{"fact":"值得长期记住的事实或偏好","category":"偏好|事实|任务"}]}
+
+要求：
+- diary.summary 精简一句话；keypoints 最多 3 条
+- longterm 只提取跨会话仍有价值的信息（用户偏好、习惯、重要决定、待办），去重、不记琐碎闲聊
+- 没有值得长期记的，longterm 返回空数组 []
+- 严格输出合法 JSON，不要用 markdown 代码块包裹`;
+
+// 非流式调助手 API，返回完整文本（供记忆巩固用，不复用 handleAssistant 的流式逻辑）
+function callAssistantNonStream(messages) {
+  return new Promise((resolve, reject) => {
+    const a = settings.assistant || {};
+    if (!a.baseUrl || !a.key || !a.model) { reject(new Error('助手 API 未配置')); return; }
+    const base = normalizeBase(a.baseUrl).replace(/\/v1$/, '');
+    const target = new URL(base + '/v1/chat/completions');
+    const payload = JSON.stringify({ model: a.model, messages, stream: false });
+    const transport = target.protocol === 'https:' ? https : http;
+    const req = transport.request({
+      hostname: target.hostname,
+      port: target.port || (target.protocol === 'https:' ? 443 : 80),
+      path: target.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${a.key}`,
+        'Content-Length': Buffer.byteLength(payload),
+      },
+      timeout: 180000,
+    }, (res) => {
+      let data = '';
+      res.on('data', c => { data += c; });
+      res.on('end', () => {
+        if (res.statusCode !== 200) { reject(new Error(`助手 API HTTP ${res.statusCode}`)); return; }
+        try {
+          const j = JSON.parse(data);
+          const content = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
+          resolve(content || '');
+        } catch (e) { reject(e); }
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+    req.write(payload);
+    req.end();
+  });
+}
+
+// 从助手回复里提取 JSON（容错：去掉 markdown 代码块包裹/前后杂字）
+function extractJSON(text) {
+  let t = String(text || '').trim();
+  const m = t.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (m) t = m[1].trim();
+  const start = t.indexOf('{');
+  const end = t.lastIndexOf('}');
+  if (start >= 0 && end > start) t = t.slice(start, end + 1);
+  return JSON.parse(t);
+}
+
+// 巩固：把一段对话总结成日记 + 长期记忆（失败返回 ok:false，不阻塞调用方）
+async function handleConsolidate(req, res, body) {
+  let parsed;
+  try { parsed = JSON.parse(body); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+  const history = (Array.isArray(parsed.history) ? parsed.history : [])
+    .filter(m => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content);
+  if (history.length === 0) return sendJSON(res, 400, { error: '没有可总结的对话' });
+
+  const messages = [
+    { role: 'system', content: CONSOLIDATE_SYSTEM },
+    { role: 'user', content: '请总结以下对话：\n\n' + history.map(m => `${m.role === 'user' ? '用户' : '助手'}：${m.content}`).join('\n\n') },
+  ];
+  try {
+    const raw = await callAssistantNonStream(messages);
+    const result = extractJSON(raw);
+    let diaryAdded = 0, longtermAdded = 0;
+    if (result.diary && result.diary.summary) {
+      memory.diary.push({
+        time: new Date().toLocaleString('zh-CN', { hour12: false }),
+        summary: String(result.diary.summary),
+        keypoints: Array.isArray(result.diary.keypoints) ? result.diary.keypoints.slice(0, 3).map(String) : [],
+      });
+      diaryAdded = 1;
+    }
+    if (Array.isArray(result.longterm)) {
+      for (const item of result.longterm) {
+        if (!item || !item.fact) continue;
+        const fact = String(item.fact);
+        if (memory.longterm.some(x => x.fact === fact)) continue; // 去重
+        memory.longterm.push({
+          time: new Date().toLocaleString('zh-CN', { hour12: false }),
+          fact,
+          category: String(item.category || '事实'),
+          source: 'consolidate',
+        });
+        longtermAdded++;
+      }
+    }
+    saveMemory();
+    console.log(`🧠 记忆巩固完成：日记+${diaryAdded}，长期记忆+${longtermAdded}`);
+    sendJSON(res, 200, { ok: true, diaryAdded, longtermAdded });
+  } catch (e) {
+    console.log('记忆巩固失败:', e.message);
+    sendJSON(res, 200, { ok: false, error: e.message });
+  }
 }
 
 // ============ 管理面板基础设施（仅本机 + 防 DNS rebinding） ============
@@ -861,78 +1007,44 @@ function redundantCount(model) {
 }
 
 const stability = { running: false, results: {}, lastTest: 0 };
-// 推荐标准（硬）：冗余 ≥ 2 站 且 实测 2 次全通过
+// 推荐模型 = 今天真实使用过的模型（零测活）：成功率≥80%，按平均延迟升序
+// 数据来源：stats 当天分桶的 byModel（真实业务流量，绝非测试请求）
 function computeRecommended() {
-  return Object.entries(stability.results)
-    .filter(([, r]) => r.redundant >= 2 && r.ok >= 2 && r.fail === 0)
-    .map(([model, r]) => ({
-      alias: model, vendor: r.vendor, ms: r.ms, redundant: r.redundant,
-      note: `${r.redundant} 站冗余，实测 ${r.ok}/${r.ok + r.fail} 次通过`,
+  const b = stats[todayKey()] || {};
+  const rec = [];
+  for (const m of availableModels()) {
+    const cell = (b.byModel && b.byModel[String(m).toLowerCase()]) || null; // 读侧同用小写 key
+    if (!cell || cell.reqs < 1) continue; // 今天没实际用过的模型无数据，暂不推荐
+    const rate = cell.ok / cell.reqs;
+    if (rate < 0.8) continue; // 成功率低于 80% 的不推荐
+    const avgMs = Math.round(cell.ms / cell.reqs);
+    rec.push({
+      alias: m,
+      vendor: vendorOf(m),
+      ms: avgMs,
+      redundant: redundantCount(m),
+      note: `今天用 ${cell.reqs} 次，成功率 ${Math.round(rate * 100)}%，平均 ${avgMs}ms`,
       available: true,
-    }))
-    .sort((a, b) => b.redundant - a.redundant || a.ms - b.ms);
-}
-
-function testModelOnce(model) {
-  return new Promise((resolve) => {
-    const payload = JSON.stringify({ model, messages: [{ role: 'user', content: '回复ok' }], max_tokens: 16 });
-    const req = http.request({
-      host: '127.0.0.1', port: MY_PORT, path: '/v1/chat/completions', method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${settings.apiKey}`,
-        'Content-Length': Buffer.byteLength(payload),
-      },
-      timeout: 60000,
-    }, (res) => {
-      let data = '';
-      res.on('data', c => { data += c; if (data.length > 50000) req.destroy(); });
-      res.on('end', () => {
-        let ok = false;
-        if (res.statusCode === 200) {
-          try {
-            const j = JSON.parse(data);
-            ok = Array.isArray(j.choices) && j.choices.length > 0 && j.choices[0].message != null;
-          } catch (e) {}
-        }
-        resolve(ok);
-      });
     });
-    req.on('timeout', () => req.destroy());
-    req.on('error', () => resolve(false));
-    req.write(payload);
-    req.end();
-  });
+  }
+  return rec.sort((a, b) => (a.ms || 0) - (b.ms || 0)); // 延迟低优先
+}
+// 可用模型 = 探活通 + 最近实测跑通（没实测过时回退候选池，防重启后空列表）
+function verifiedModels() {
+  if (!stability.lastTest || Object.keys(stability.results).length === 0) return availableModels();
+  const models = new Set();
+  for (const m of availableModels()) {
+    const r = stability.results[m];
+    if (r && r.ok >= 1 && r.fail === 0) models.add(m);
+  }
+  return [...models].sort();
 }
 
 async function runStabilityTest() {
-  if (stability.running) return;
-  stability.running = true;
-  stability.results = {};
-  // 只测有冗余的候选（单站模型不配进推荐，不浪费请求）
-  const candidates = availableModels().filter(m => redundantCount(m) >= 2);
-  const CONCURRENCY = 4;
-  let idx = 0;
-  async function worker() {
-    while (idx < candidates.length) {
-      const model = candidates[idx++];
-      let ok = 0, fail = 0, msSum = 0;
-      for (let i = 0; i < 2; i++) {
-        const t0 = Date.now();
-        const good = await testModelOnce(model);
-        msSum += Date.now() - t0;
-        good ? ok++ : fail++;
-      }
-      stability.results[model] = {
-        ok, fail, ms: Math.round(msSum / Math.max(1, ok + fail)),
-        redundant: redundantCount(model), vendor: vendorOf(model),
-      };
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, candidates.length) }, worker));
+  // 因上游测活检测封号政策，稳定性测试已禁用（不再发送任何测试请求）
   stability.running = false;
   stability.lastTest = Date.now();
-  console.log(`🧪 稳定性测试完成：${candidates.length} 个候选，推荐 ${computeRecommended().length} 个`);
+  console.log('🧪 稳定性测试已禁用（上游测活检测封号政策）');
 }
 
 // ============ apply（AI/手动变更应用，批量） ============
@@ -1022,7 +1134,7 @@ async function handleAdmin(req, res, reqUrl) {
     sendJSON(res, 200, {
       port: MY_PORT,
       uptime: Math.floor((Date.now() - startedAt) / 1000),
-      models: availableModels(),
+      models: verifiedModels(),
       recommended: computeRecommended(),
       kickedCount: providerList.filter(p => p.disabledBy === 'auto').length,
       providers,
@@ -1104,7 +1216,9 @@ async function handleAdmin(req, res, reqUrl) {
       else if (op.op === 'delPreference' && Number.isInteger(op.index)) memory.preferences.splice(op.index, 1);
       else if (op.op === 'delStash' && Number.isInteger(op.index)) memory.stash.splice(op.index, 1);
       else if (op.op === 'addStash' && op.item) memory.stash.push(op.item);
-      else if (op.op === 'clearAll') memory = { changelog: [], stash: [], preferences: [] };
+      else if (op.op === 'delDiary' && Number.isInteger(op.index)) memory.diary.splice(op.index, 1);
+      else if (op.op === 'delLongterm' && Number.isInteger(op.index)) memory.longterm.splice(op.index, 1);
+      else if (op.op === 'clearAll') memory = { changelog: [], stash: [], preferences: [], diary: [], longterm: [] };
       else return sendJSON(res, 400, { error: '未知操作' });
       saveMemory();
       sendJSON(res, 200, memory);
@@ -1124,6 +1238,30 @@ async function handleAdmin(req, res, reqUrl) {
     const r = await sniffModels(p2.baseUrl, p2.key);
     sendJSON(res, 200, { name, ok: r.ok, ms: Date.now() - t0, status: r.ok ? 200 : 0, err: r.ok ? '' : r.err });
     return;
+  }
+
+  // 灵活检测：type=site 测站点连通；type=model 测某模型在各站的真实可用性
+  if (m === 'POST' && p === '/admin/api/check') {
+    const body = await readBody(req);
+    let { type, target } = {};
+    try { ({ type, target } = JSON.parse(body)); } catch (e) {}
+    if (!target) return sendJSON(res, 400, { error: '缺少 target' });
+    if (type === 'model') {
+      const cands = findProviders(target);
+      if (cands.length === 0) return sendJSON(res, 404, { error: `模型 ${target} 未配置在任何站` });
+      // 因上游测活检测封号政策，不再发真实请求测模型，只返回配置信息
+      const results = cands.map(cand => ({
+        provider: cand.provider, realModel: cand.realModel,
+        note: '已配置（探活判定）',
+      }));
+      return sendJSON(res, 200, { type: 'model', target, results });
+    }
+    // 默认 type=site
+    const p2 = PROVIDERS[target];
+    if (!p2) return sendJSON(res, 404, { error: `站 ${target} 不存在` });
+    const t0 = Date.now();
+    const r = await sniffModels(p2.baseUrl, p2.key);
+    return sendJSON(res, 200, { type: 'site', target, ok: r.ok, ms: Date.now() - t0, err: r.ok ? '' : r.err });
   }
 
   if (m === 'POST' && p === '/admin/api/probe') {
@@ -1151,6 +1289,7 @@ async function handleAdmin(req, res, reqUrl) {
     if (!baseUrl) return sendJSON(res, 400, { error: '缺少 baseUrl' });
     if (!key) return sendJSON(res, 400, { error: '缺少 key（新站请填写，已有站可留空自动使用保存的 key）' });
     const r = await sniffModels(baseUrl, key);
+    // 因上游测活检测封号政策，不再发真实请求实测模型，只返回探活列表供参考
     sendJSON(res, r.ok ? 200 : 400, r);
     return;
   }
@@ -1238,6 +1377,11 @@ async function handleAdmin(req, res, reqUrl) {
     return handleAssistant(req, res, body);
   }
 
+  if (m === 'POST' && p === '/admin/api/consolidate') {
+    const body = await readBody(req);
+    return handleConsolidate(req, res, body);
+  }
+
   sendJSON(res, 404, { error: 'Not Found' });
 }
 
@@ -1262,7 +1406,7 @@ const server = http.createServer((req, res) => {
 
   // 管理面板请求不打业务日志（轮询会刷屏）
   if (!reqPath.startsWith('/admin/')) {
-    console.log(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] ${method} ${reqPath}`);
+    console.log(`${method} ${reqPath}`);
   }
 
   // ---- 静态管理页 ----
@@ -1292,7 +1436,7 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       object: 'list',
-      data: availableModels().map(m2 => ({ id: m2, object: 'model' }))
+      data: verifiedModels().map(m2 => ({ id: m2, object: 'model' }))
     }));
     return;
   }
@@ -1318,6 +1462,7 @@ const server = http.createServer((req, res) => {
   let body = '';
   req.on('data', chunk => { body += chunk; });
   req.on('end', async () => {
+    try {
     let parsed;
     try {
       parsed = JSON.parse(body);
@@ -1373,17 +1518,17 @@ const server = http.createServer((req, res) => {
     recordClientResult(true);
     res.writeHead(result.statusCode, result.headers);
     const stream = result.stream;
-    // 流式 usage 解析：从尾部找最后一个可解析的 "usage" 对象（兼容嵌套与 usage:null 干扰）
+    // 流式 usage 解析：只保留尾部 chunk，在流结束时解析一次（避免每个 chunk 全量扫描占满主线程，
+    // opus/thinking 等长流会产生海量 chunk，逐块扫描会拖垮主线程导致健康检查超时误判僵尸）
     let usageTail = '';
-    let usageDone = false;
     stream.on('data', (chunk) => {
-      if (usageDone) return;
-      usageTail = (usageTail + chunk.toString('utf8')).slice(-65536);
-      // 从后往前遍历所有 "usage" 位置，跳过 null/失败项，取第一个能解析出真实 tokens 的
+      usageTail = (usageTail + chunk.toString('utf8')).slice(-16384); // 只留尾部 16KB
+    });
+    function parseUsageFromTail() {
       let searchFrom = usageTail.length;
-      while (!usageDone) {
+      for (;;) {
         const idx = usageTail.lastIndexOf('"usage"', searchFrom);
-        if (idx < 0) break;
+        if (idx < 0) return;
         searchFrom = idx - 1;
         const start = usageTail.indexOf('{', idx);
         if (start < 0) continue;
@@ -1395,18 +1540,16 @@ const server = http.createServer((req, res) => {
         if (end <= 0) continue;
         try {
           const u = JSON.parse(usageTail.slice(start, end));
-          if (u && (u.prompt_tokens || u.completion_tokens)) {
-            recordStreamTokens(cand.provider, modelName, u);
-            usageDone = true;
-          }
+          if (u && (u.prompt_tokens || u.completion_tokens)) { recordStreamTokens(cand.provider, modelName, u); return; }
         } catch (e) {}
       }
-    });
+    }
     // 流式延迟 = 完整流式时长（end 或客户端断开 close 都记录，只记一次）
     let streamRecorded = false;
     const recordStream = () => {
       if (streamRecorded) return;
       streamRecorded = true;
+      try { parseUsageFromTail(); } catch (e) {}
       recordAttempt(modelName, cand.provider, Date.now() - t0, 200, true, true, null);
     };
     stream.on('end', recordStream);
@@ -1466,6 +1609,7 @@ const server = http.createServer((req, res) => {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: { message: 'all providers failed', type: 'proxy_error' } }));
     }
+    } catch (e) { console.log('! 请求处理异常:', e.message); }
   });
 });
 
@@ -1482,8 +1626,5 @@ server.listen(MY_PORT, HOST, () => {
   console.log(`\n📦 去重后配置模型 ${allModelsSorted().length} 个，当前可用 ${availableModels().length} 个`);
   scheduleProbe();
   setTimeout(runProbeAll, 3000); // 启动 3 秒后先探活一轮
-  // 探活完成后自动测稳定性（每次启动/重启都会自动跑，推荐模型自动更新，无需手动）
-  setTimeout(() => {
-    runStabilityTest().catch(e => console.log('自动稳定性测试出错:', e.message));
-  }, 15000);
+  // 稳定性测试改为手动触发（总览页「测试稳定性」按钮），不再自动跑，防忙碌时健康检查超时误判僵尸重启
 });
