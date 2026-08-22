@@ -194,18 +194,18 @@ setInterval(() => {
   const req = http.get({
     host: '127.0.0.1', port: PORT, path: '/v1/models',
     headers: { Authorization: `Bearer ${readApiKey()}` },
-    timeout: 3000,
+    timeout: 8000,
   }, (res) => { res.resume(); if (!settled) { settled = true; healthFails = 0; } });
   req.on('timeout', () => req.destroy(new Error('timeout')));
   req.on('error', () => {
     if (settled) return;
     settled = true;
     healthFails++;
-    if (healthFails >= 3) {
+    if (healthFails >= 4) {
       healthFails = 0;
       state.zombieRestarts++;
       saveState();
-      console.log('[supervisor] 健康检查连续 3 次失败，判定僵死，强杀重启');
+      console.log('[supervisor] 健康检查连续 4 次失败，判定僵死，强杀重启');
       notify('服务无响应，已强制重启');
       killTree(routerProc.pid);
     }
