@@ -184,11 +184,11 @@ function renderStatus(s) {
   $('#modelCount').textContent = s.models.length;
   // 推荐模型清单（由稳定性测试动态产生）
   const rec = (s.recommended || []).map(r => {
-    return `<span class="chip rec-ok" title="${escapeHtml(r.note)}">⭐ ${escapeHtml(r.alias)}<span class="rec-vendor"> ${escapeHtml(r.vendor)}</span></span>`;
+    return `<span class="chip rec-ok" title="${escapeHtml(r.note)} · 点击复制模型名" data-copy="${escapeHtml(r.alias)}">⭐ ${escapeHtml(r.alias)}<span class="rec-vendor"> ${escapeHtml(r.vendor)}</span></span>`;
   }).join('');
   $('#recommendedModels').innerHTML = rec
-    ? `<div class="rec-title">⭐ 推荐模型（实测通过：≥2 站冗余且 2 次全成功）</div><div>${rec}</div>`
-    : `<div class="rec-title">⭐ 推荐模型</div><div class="hint">尚未测试。点「🧪 测试稳定性」按钮，或在 AI 助手对话框说「测测哪些模型稳定」，系统会实测后自动推荐。</div>`;
+    ? `<div class="rec-title">⭐ 推荐模型（今天实际使用，按延迟排序）</div><div>${rec}</div>`
+    : `<div class="rec-title">⭐ 推荐模型</div><div class="hint">今天还没用过模型。你真实使用时系统自动记录（零测活），用过后这里会按成功率+延迟推荐。</div>`;
   renderModelGroups();
 }
 
@@ -223,9 +223,13 @@ function renderModelGroups() {
 $('#modelSearch').addEventListener('input', (e) => { modelKeyword = e.target.value; renderModelGroups(); });
 $('#tab-overview').addEventListener('click', (e) => {
   const btn = e.target.closest('.copy-btn');
-  if (!btn) return;
-  if (btn.dataset.copy === '__ASKKEY__') { toast('完整 key 请到「Provider 管理」编辑框或 settings.json 查看', ''); return; }
-  copyText(btn.dataset.copy);
+  if (btn) {
+    if (btn.dataset.copy === '__ASKKEY__') { toast('完整 key 请到「Provider 管理」编辑框或 settings.json 查看', ''); return; }
+    copyText(btn.dataset.copy);
+    return;
+  }
+  const chip = e.target.closest('[data-copy].rec-ok');
+  if (chip) { copyText(chip.dataset.copy); toast(`已复制模型名 ${chip.dataset.copy}`, 'ok'); }
 });
 
 /* ============ Provider 管理 ============ */
@@ -418,7 +422,7 @@ function openProviderModal(name) {
       });
       if (r.ok) {
         $('#fModels').value = r.models.join('\n');
-        $('#fFetchNote').innerHTML = `✅ 获取到 <b>${r.count}</b> 个模型${r.count > 50 ? '（已全部填入，较多可手动删减）' : ''}`;
+        $('#fFetchNote').innerHTML = `✅ 获取到 <b>${r.count}</b> 个模型${r.count > 50 ? '（较多可手动删减）' : ''}`;
       } else {
         $('#fFetchNote').textContent = `❌ ${r.error || r.err}`;
       }
@@ -502,30 +506,106 @@ function fillKeys(text) {
   return String(text || '').replace(/\{\{KEY_\d+\}\}/g, (m) => keyMap[m] || m);
 }
 
+// 流式渲染节流：每动画帧最多重绘一次（避免每个 SSE chunk 全量重绘卡顿）
+let renderScheduled = false;
+function scheduleRender() {
+  if (renderScheduled) return;
+  renderScheduled = true;
+  requestAnimationFrame(() => { renderScheduled = false; renderChat(); });
+}
 function renderChat() {
   const box = $('#chatBox');
-  box.innerHTML = chatStore.map(m => {
+  const streaming = assistantAbort !== null; // 流式中
+  box.innerHTML = chatStore.map((m, idx) => {
     if (m.role === 'sysline') return `<div class="sysline">${escapeHtml(m.content)}</div>`;
     const body = m.role === 'assistant' ? renderMarkdown(m.content) : escapeHtml(m.content);
-    return `<div class="msg ${m.role}"><div class="who">${m.role === 'user' ? '我' : '助手'}</div><div class="body">${body}</div></div>`;
+    const cursor = (streaming && idx === chatStore.length - 1 && m.role === 'assistant') ? '<span class="cursor-blink">▍</span>' : '';
+    return `<div class="msg ${m.role}"><div class="who">${m.role === 'user' ? '我' : '助手'}</div><div class="body">${body}${cursor}</div></div>`;
   }).join('');
   box.scrollTop = box.scrollHeight;
 }
-function renderMarkdown(text) {
-  // 轻量渲染：代码块 -> pre（带复制），行内 code，加粗，其余转义
-  const parts = String(text || '').split(/```(?:json)?\n?([\s\S]*?)```/g);
+
+// 行内格式：code / 加粗 / 斜体（先转义）
+function renderInline(text) {
+  return escapeHtml(text)
+    .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
+    .replace(/(^|[^*\s])\*([^*\n]+)\*(?!\*)/g, '$1<i>$2</i>');
+}
+// 代码块：带语言标签 + 复制按钮
+function renderCodeBlock(lang, code) {
+  const id = 'cp' + Math.random().toString(36).slice(2, 8);
+  const langTag = lang ? `<span class="code-lang">${escapeHtml(lang)}</span>` : '';
+  return `<div class="code-block"><div class="code-head">${langTag}<button class="btn sm ghost copy-btn" data-copy-id="${id}">复制</button></div><pre><code id="${id}">${escapeHtml(code)}</code></pre></div>`;
+}
+// 块级渲染：标题/分隔线/引用/列表/表格/段落
+function renderBlocks(text) {
+  const lines = text.split('\n');
   let html = '';
-  for (let i = 0; i < parts.length; i++) {
-    if (i % 2 === 1) {
-      const code = parts[i];
-      const id = 'cp' + Math.random().toString(36).slice(2, 8);
-      html += `<pre><button class="btn sm ghost copy-btn" data-copy-id="${id}">复制</button><code id="${id}">${escapeHtml(code)}</code></pre>`;
-    } else {
-      html += escapeHtml(parts[i])
-        .replace(/`([^`\n]+)`/g, '<code>$1</code>')
-        .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) { i++; continue; }
+    // 标题
+    const h = line.match(/^(#{1,4})\s+(.*)/);
+    if (h) { html += `<h${h[1].length}>${renderInline(h[2])}</h${h[1].length}>`; i++; continue; }
+    // 分隔线
+    if (/^\s*(-{3,}|\*{3,})\s*$/.test(line)) { html += '<hr>'; i++; continue; }
+    // 引用
+    if (/^\s*>\s?/.test(line)) {
+      const q = [];
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) { q.push(lines[i].replace(/^\s*>\s?/, '')); i++; }
+      html += `<blockquote>${renderInline(q.join('<br>'))}</blockquote>`;
+      continue;
     }
+    // 无序列表
+    if (/^\s*[-*+]\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) { items.push(lines[i].replace(/^\s*[-*+]\s+/, '')); i++; }
+      html += '<ul>' + items.map(x => `<li>${renderInline(x)}</li>`).join('') + '</ul>';
+      continue;
+    }
+    // 有序列表
+    if (/^\s*\d+[.、]\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*\d+[.、]\s+/.test(lines[i])) { items.push(lines[i].replace(/^\s*\d+[.、]\s+/, '')); i++; }
+      html += '<ol>' + items.map(x => `<li>${renderInline(x)}</li>`).join('') + '</ol>';
+      continue;
+    }
+    // 表格（下一行是 |---| 分隔行）
+    if (line.includes('|') && i + 1 < lines.length && /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i + 1])) {
+      const cells = (s) => s.split('|').map(x => x.trim()).filter(x => x !== '');
+      const header = cells(line);
+      const rows = [];
+      i += 2;
+      while (i < lines.length && lines[i].includes('|')) { rows.push(cells(lines[i])); i++; }
+      html += '<table><thead><tr>' + header.map(h2 => `<th>${renderInline(h2)}</th>`).join('') + '</tr></thead><tbody>'
+        + rows.map(r => '<tr>' + r.map(c => `<td>${renderInline(c)}</td>`).join('') + '</tr>').join('') + '</tbody></table>';
+      continue;
+    }
+    // 段落：合并连续普通文本行
+    const para = [line];
+    i++;
+    while (i < lines.length && lines[i].trim()
+      && !/^(#{1,4}\s|[-*+]\s|\d+[.、]\s|>|```|\s*[-*]{3,})/.test(lines[i])
+      && !(lines[i].includes('|') && /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i + 1] || ''))) {
+      para.push(lines[i]); i++;
+    }
+    html += `<p>${renderInline(para.join('<br>'))}</p>`;
   }
+  return html;
+}
+function renderMarkdown(text) {
+  const t = String(text || '');
+  let html = '';
+  const re = /```(\w*)\n?([\s\S]*?)```/g;
+  let last = 0, m;
+  while ((m = re.exec(t)) !== null) {
+    html += renderBlocks(t.slice(last, m.index));
+    html += renderCodeBlock(m[1], m[2]);
+    last = re.lastIndex;
+  }
+  html += renderBlocks(t.slice(last));
   return html;
 }
 $('#chatBox').addEventListener('click', (e) => {
@@ -578,7 +658,13 @@ $('#asSave').onclick = async () => {
   } catch (e) { toast(e.message, 'err'); }
 };
 
-/* 发送对话 */
+// 从 URL 提取站名（域名第一部分）
+function extractName(url) {
+  const m = String(url || '').match(/https?:\/\/([^\/]+)/);
+  return m ? m[1].split('.')[0] : 'new-site';
+}
+
+// 发送对话
 let assistantBusy = false;
 $('#chatSend').onclick = () => {
   if (assistantAbort) { assistantAbort.abort(); return; } // 流式中点击 = 停止
@@ -616,9 +702,38 @@ async function sendChat() {
     try {
       const r = await api('/admin/api/probe-models', { method: 'POST', body: { baseUrl: probeBase, key: found[0] } });
       if (r.ok) {
-        const list = r.models.slice(0, 80).join('、') + (r.count > 80 ? ` …等 ${r.count} 个` : '');
-        chatStore.push({ role: 'sysline', content: `✅ 已自动探测到 ${r.count} 个模型（已提供给助手）` });
-        finalText = masked + `\n\n[系统自动探测] 该站支持的模型列表：${list}`;
+        // 直接弹应用确认框（跳过 AI 对话，一步到位）
+        openModal(`
+          <h3>➕ 新增中转站 — ${escapeHtml(extractName(probeBase))}</h3>
+          <div class="form-grid">
+            <label>站名<input id="amName" value="${escapeHtml(extractName(probeBase))}" placeholder="唯一标识名"></label>
+            <label>地址<input id="amBase" value="${escapeHtml(probeBase)}" readonly class="input"></label>
+            <label>API Key<input id="amKey" type="password" value="${escapeHtml(found[0])}" readonly class="input"></label>
+            <label>模型（勾选要添加的，${r.count} 个声明）
+              <div id="amModels" style="max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:6px">
+                ${r.models.map(m => `<label style="display:block;margin:2px 0"><input type="checkbox" class="am-model" checked value="${escapeHtml(m)}"> ${escapeHtml(m)}</label>`).join('')}
+              </div>
+            </label>
+          </div>
+          <div class="m-actions">
+            <button class="btn" id="amCancel">取消</button>
+            <button class="btn primary" id="amConfirm">确认添加</button>
+          </div>`);
+        $('#amCancel').onclick = closeModal;
+        $('#amConfirm').onclick = async () => {
+          const models = [...document.querySelectorAll('.am-model:checked')].map(c => c.value);
+          if (!models.length) { toast('请至少勾选一个模型', 'err'); return; }
+          const name = $('#amName').value.trim();
+          if (!name) { toast('请输入站名', 'err'); return; }
+          try {
+            await api('/admin/api/apply', { method: 'POST', body: { ops: [{ action: 'add', provider: { name, baseUrl: probeBase, key: found[0], models, aliases: {} } }], source: '手动' } });
+            toast(`✅ 已添加 ${name}（${models.length} 个模型）`, 'ok');
+            closeModal();
+            refreshStatus();
+          } catch (e) { toast(e.message, 'err'); }
+        };
+        // 不再继续发给 AI 对话
+        return;
       } else {
         chatStore.push({ role: 'sysline', content: `❌ 探测失败：${r.error || r.err}` });
         finalText = masked + `\n\n[系统自动探测失败：${r.error || r.err}，请如实告知用户并让其检查地址/key，禁止编造模型列表]`;
@@ -651,6 +766,37 @@ async function sendChat() {
   await handleAssistantReply(fullText);
   sendBtn.disabled = false;
   assistantBusy = false;
+  maybeAutoConsolidate(); // 每满10轮后台自动巩固记忆（海马体）
+}
+
+/* 海马体记忆巩固：把对话总结成日记 + 提取长期记忆 */
+let lastConsolidatedIndex = 0; // 已巩固到的 chatStore 索引（只总结新增对话，防重复）
+async function consolidateChat(history, silent) {
+  try {
+    const r = await api('/admin/api/consolidate', { method: 'POST', body: { history } });
+    if (r.ok) {
+      if (silent) {
+        chatStore.push({ role: 'sysline', content: `🧠 已自动巩固记忆（长期记忆 +${r.longtermAdded}）` });
+      } else {
+        toast(`已总结进记忆库：日记 +${r.diaryAdded}，长期记忆 +${r.longtermAdded}`, 'ok');
+      }
+      return true;
+    }
+    if (!silent) toast(r.error || '总结失败', 'err');
+  } catch (e) {
+    if (!silent) toast('总结失败：' + e.message, 'err');
+  }
+  return false;
+}
+function maybeAutoConsolidate() {
+  const newMsgs = chatStore.slice(lastConsolidatedIndex).filter(m => m.role === 'user' || m.role === 'assistant');
+  const newUserCount = chatStore.slice(lastConsolidatedIndex).filter(m => m.role === 'user').length;
+  if (newUserCount >= 10) {
+    lastConsolidatedIndex = chatStore.length; // 先记索引，防并发重复触发
+    consolidateChat(newMsgs, true).then(ok => {
+      if (ok) { persistChat(); renderChat(); refreshMemory(); }
+    });
+  }
 }
 
 // 发起一轮助手对话（流式渲染到新 assistant 消息），返回完整回复文本
@@ -693,7 +839,7 @@ async function streamAssistant(history) {
             if (delta && delta.content) aiMsg.content += delta.content;
           } catch (e) {}
         }
-        renderChat();
+        scheduleRender();
       }
     }
   } catch (e) {
@@ -759,41 +905,8 @@ async function handleAssistantReply(fullText) {
   }
 }
 
-/* 工具：测试模型稳定性（AI 助手可调用） */
+/* 工具：sleep 供探测等使用（稳定性测试已下线，改由真实使用数据推荐） */
 function sleep(ms) { return new Promise(res => setTimeout(res, ms)); }
-async function runStabilityTool() {
-  chatStore.push({ role: 'sysline', content: '🧪 正在测试模型稳定性（对多站冗余模型各实测 2 次）…' });
-  renderChat();
-  try {
-    await api('/admin/api/stability-test', { method: 'POST' });
-    let r = null;
-    for (let i = 0; i < 150; i++) {
-      await sleep(3000);
-      r = await api('/admin/api/stability-test').catch(() => null);
-      if (r && !r.running) break;
-    }
-    if (!r || r.running) {
-      chatStore.push({ role: 'sysline', content: '⚠️ 测试仍在进行，可稍后在「总览」页查看结果' });
-      renderChat();
-      return;
-    }
-    const rec = r.recommended || [];
-    const summary = rec.length
-      ? rec.map(x => `${x.alias}（${x.note}）`).join('；')
-      : '没有任何模型通过（标准：2 次实测全成功 + 至少 2 站冗余）';
-    chatStore.push({ role: 'sysline', content: rec.length ? `✅ 测试完成，推荐：${rec.map(x => '⭐ ' + x.alias).join(' ')}` : '✅ 测试完成，暂无模型通过' });
-    renderChat();
-    // 把结果回传给助手，让它用中文总结
-    chatStore.push({ role: 'user', content: `[系统工具结果] 稳定性测试已完成。${summary}。请用中文简洁地告诉用户哪些模型最稳定、推荐用哪个。` });
-    renderChat();
-    const history = chatStore.filter(m => m.role === 'user' || m.role === 'assistant').slice(-20);
-    const full = await streamAssistant(history);
-    await handleAssistantReply(full);
-  } catch (e) {
-    chatStore.push({ role: 'sysline', content: `❌ 稳定性测试失败：${e.message}` });
-    renderChat();
-  }
-}
 
 /* 通用工具执行：取结果 → 回传给 AI 总结（带递归深度限制） */
 let toolDepth = 0;
@@ -908,7 +1021,7 @@ async function runToggleTool(args) {
 }
 
 const toolHandlers = {
-  'stability-test': runStabilityTool,
+  'check': runCheckTool,
   'status': runStatusTool,
   'probe': runProbeTool,
   'test': runTestTool,
@@ -917,6 +1030,24 @@ const toolHandlers = {
   'priority': runPriorityTool,
   'toggle': runToggleTool,
 };
+
+// 灵活检测：type=model 测某模型在各站真实可用性；type=site 测站点连通
+async function runCheckTool(args) {
+  const { type, target } = args || {};
+  if (!target) {
+    chatStore.push({ role: 'sysline', content: '⚠️ 需要检测目标，如 {"tool":"check","type":"model","target":"glm-5.2"}' });
+    renderChat();
+    return;
+  }
+  await runTool(`正在检测${type === 'model' ? '模型 ' : '站点 '}${target}`, async () => {
+    const r = await api('/admin/api/check', { method: 'POST', body: { type: type || 'site', target } });
+    if (r.type === 'model') {
+      const lines = r.results.map(x => `${x.provider}：${x.ok ? `通（${x.ms}ms，真实模型 ${x.realModel}）` : `不通（${x.err}）`}`);
+      return `模型 ${target} 在 ${r.results.length} 个站的情况：\n${lines.join('\n')}`;
+    }
+    return r.ok ? `站点 ${target} 连通，延迟 ${r.ms}ms` : `站点 ${target} 不通：${r.err}`;
+  });
+}
 
 /* 提案渲染与应用 */
 async function addProposals(ops) {
@@ -1044,6 +1175,22 @@ $('#chatBox').addEventListener('click', async (e) => {
 });
 
 /* 手动 JSON 兜底 */
+// 清空会话：先总结进记忆库，再清空聊天记录
+$('#clearChatBtn').onclick = async () => {
+  const history = chatStore.filter(m => m.role === 'user' || m.role === 'assistant');
+  if (!history.length) { toast('当前没有对话', ''); return; }
+  if (!(await confirmDlg('清空会话', '将把当前对话总结进记忆库（日记+长期记忆），然后清空聊天记录。确定？', false))) return;
+  toast('正在总结进记忆库…');
+  const ok = await consolidateChat(history, false);
+  if (ok) {
+    chatStore = [];
+    lastConsolidatedIndex = 0;
+    persistChat();
+    renderChat();
+    refreshMemory();
+  }
+};
+
 $('#manualJsonBtn').onclick = () => {
   openModal(`
     <h3>手动应用变更 JSON</h3>
@@ -1079,10 +1226,33 @@ async function refreshMemory() {
         <button class="btn sm danger" data-delstash="${i}">删</button></div>`).join('') || '<span class="hint">暂无暂存资源</span>';
     const changes = (mem.changelog || []).slice(-15).reverse().map(c => `
       <div class="mem-item"><span>[${escapeHtml(c.source)}] ${escapeHtml(c.detail)}</span><span class="hint">${escapeHtml(c.time)}</span></div>`).join('') || '<span class="hint">暂无变更记录</span>';
+    const diary = (mem.diary || []).map((d, i) => `
+      <div class="mem-item"><span><b>${escapeHtml(d.summary)}</b>${d.keypoints && d.keypoints.length ? '<br><span class="hint">' + d.keypoints.map(escapeHtml).join('；') + '</span>' : ''}</span>
+        <span><span class="hint">${escapeHtml(d.time)}</span> <button class="btn sm danger" data-deldiary="${i}">删</button></span></div>`).join('') || '<span class="hint">暂无日记（对话满10轮或清空会话时自动生成）</span>';
+    const longterm = (mem.longterm || []).map((l, i) => `
+      <div class="mem-item"><span><span class="tag tag-warn">${escapeHtml(l.category || '事实')}</span> ${escapeHtml(l.fact)}</span>
+        <button class="btn sm danger" data-dellongterm="${i}">删</button></div>`).join('') || '<span class="hint">暂无长期记忆（从对话自动提取）</span>';
     $('#memoryPanel').innerHTML = `
-      <div class="mem-section"><h4>偏好记忆</h4>${prefs}</div>
-      <div class="mem-section"><h4>未应用资源</h4>${stash}</div>
-      <div class="mem-section"><h4>变更历史（最近15条）</h4>${changes}</div>
+      <details class="mem-collapse">
+        <summary>🧠 长期记忆（${(mem.longterm || []).length}）</summary>
+        <div class="mem-body">${longterm}</div>
+      </details>
+      <details class="mem-collapse">
+        <summary>📔 日记（${(mem.diary || []).length}）</summary>
+        <div class="mem-body">${diary}</div>
+      </details>
+      <details class="mem-collapse">
+        <summary>偏好记忆（${(mem.preferences || []).length}）</summary>
+        <div class="mem-body">${prefs}</div>
+      </details>
+      <details class="mem-collapse">
+        <summary>未应用资源（${(mem.stash || []).length}）</summary>
+        <div class="mem-body">${stash}</div>
+      </details>
+      <details class="mem-collapse">
+        <summary>变更历史（${(mem.changelog || []).length}）</summary>
+        <div class="mem-body">${changes}</div>
+      </details>
       <button class="btn sm danger" id="memClear">清空全部记忆</button>`;
     $('#memClear').onclick = async () => {
       if (!(await confirmDlg('清空记忆', '确定清空全部记忆（偏好/暂存/变更历史）？', true))) return;
@@ -1110,6 +1280,12 @@ $('#tab-assistant').addEventListener('click', async (e) => {
     }
   } else if (btn.dataset.delstash !== undefined) {
     await api('/admin/api/memory', { method: 'PUT', body: { op: 'delStash', index: parseInt(btn.dataset.delstash, 10) } }).catch(() => {});
+    refreshMemory();
+  } else if (btn.dataset.deldiary !== undefined) {
+    await api('/admin/api/memory', { method: 'PUT', body: { op: 'delDiary', index: parseInt(btn.dataset.deldiary, 10) } }).catch(() => {});
+    refreshMemory();
+  } else if (btn.dataset.dellongterm !== undefined) {
+    await api('/admin/api/memory', { method: 'PUT', body: { op: 'delLongterm', index: parseInt(btn.dataset.dellongterm, 10) } }).catch(() => {});
     refreshMemory();
   }
 });
@@ -1238,22 +1414,4 @@ setInterval(pollLogs, 2000);
 setInterval(() => { if (activeTab === 'stats') refreshStats(); }, 10000);
 
 // 总览页「测试稳定性」按钮
-$('#stabilityTestBtn').onclick = async () => {
-  const btn = $('#stabilityTestBtn');
-  btn.disabled = true;
-  btn.textContent = '测试中…';
-  try {
-    await api('/admin/api/stability-test', { method: 'POST' });
-    for (let i = 0; i < 150; i++) {
-      await sleep(3000);
-      const r = await api('/admin/api/stability-test').catch(() => null);
-      if (r && !r.running) break;
-    }
-    await refreshStatus();
-    toast('稳定性测试完成', 'ok');
-  } catch (e) {
-    toast(e.message, 'err');
-  }
-  btn.disabled = false;
-  btn.textContent = '🧪 测试稳定性';
-};
+// 稳定性测试已下线（测活封号政策），推荐模型改由真实使用数据自动产生（见 computeRecommended）
