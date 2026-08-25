@@ -155,15 +155,18 @@ function renderStatus(s) {
       <span class="k">Base URL</span>
       <span class="mono"><button class="btn sm ghost copy-btn" data-copy="${s.baseUrl}">复制</button>${s.baseUrl}</span>
       <span class="k">API Key</span>
-      <span class="mono"><button class="btn sm ghost copy-btn" data-copy="__ASKKEY__">显示</button>${s.apiKeyMasked}</span>
+      <span class="mono"><button class="btn sm ghost copy-btn" data-copy="__ASKKEY__">显示</button>${s.apiKeyMasked} <button class="btn sm" data-action="changeKey">🔑 修改密码</button></span>
+      <span class="k">局域网访问</span>
+      <span>${s.bindLan ? '✅ 已开启（同 WiFi 可用）' : '🔒 仅本机'} <button class="btn sm ${s.bindLan ? '' : 'primary'}" data-action="toggleLan">${s.bindLan ? '关闭' : '开启局域网'}</button></span>
     </div>
-    <p class="hint">ZCode / dsh 等客户端按此配置；key 点「显示」后从设置页复制完整值。</p>`;
+    ${s.bindLan && s.lanIP ? `<p class="hint">局域网设备接入：<span class="mono">http://${escapeHtml(s.lanIP)}:${s.port}/v1</span>（key 同上）。手机连不上就到 Windows 防火墙放行 ${s.port} 端口（TCP 入站）。</p>` : ''}
+    <p class="hint">ZCode / dsh 等客户端按此配置；key 点「显示」后从设置页复制完整值。开启局域网前建议先把 key 改成自己的密码。</p>`;
 
   // 健康表
   const rows = s.providers.map(p => {
     const probe = p.probe;
     const kickTag = p.enabled === false
-      ? (p.disabledBy === 'auto' ? '<span class="tag tag-bad">已踢出</span> ' : '<span class="tag tag-muted">已停用</span> ')
+      ? (p.disabledBy === 'auto' ? '<span class="tag tag-bad">已踢出</span> ' : p.disabledBy === 'quota' ? '<span class="tag tag-warn">限流停用(0点恢复)</span> ' : '<span class="tag tag-muted">已停用</span> ')
       : '';
     const probeCell = p.enabled === false ? '—'
       : !probe ? '<span class="dot idle"></span>未测'
@@ -221,7 +224,13 @@ function renderModelGroups() {
     || (kw ? `<div class="hint">没有匹配「${escapeHtml(modelKeyword.trim())}」的模型</div>` : '<div class="hint">暂无可用模型</div>');
 }
 $('#modelSearch').addEventListener('input', (e) => { modelKeyword = e.target.value; renderModelGroups(); });
-$('#tab-overview').addEventListener('click', (e) => {
+$('#tab-overview').addEventListener('click', async (e) => {
+  const actionBtn = e.target.closest('[data-action]');
+  if (actionBtn) {
+    const act = actionBtn.dataset.action;
+    if (act === 'toggleLan') { actionBtn.disabled = true; await toggleLan(); actionBtn.disabled = false; return; }
+    if (act === 'changeKey') { await changeApiKey(); return; }
+  }
   const btn = e.target.closest('.copy-btn');
   if (btn) {
     if (btn.dataset.copy === '__ASKKEY__') { toast('完整 key 请到「Provider 管理」编辑框或 settings.json 查看', ''); return; }
@@ -231,6 +240,47 @@ $('#tab-overview').addEventListener('click', (e) => {
   const chip = e.target.closest('[data-copy].rec-ok');
   if (chip) { copyText(chip.dataset.copy); toast(`已复制模型名 ${chip.dataset.copy}`, 'ok'); }
 });
+
+/* 局域网访问开关（settings 热加载约 2 秒后切换监听地址） */
+async function toggleLan() {
+  try {
+    const cur = lastStatus ? lastStatus.bindLan === true : false;
+    const next = !cur;
+    await api('/admin/api/settings', { method: 'PUT', body: { bindLan: next } });
+    if (next) {
+      toast('已开启局域网访问（约 2 秒生效）。同 WiFi 设备用你的 API Key 即可访问，请确需 key 已改成自己的密码；手机连不上记得放行 Windows 防火墙端口。', 'ok');
+    } else {
+      toast('已关闭局域网访问，恢复仅本机可访问（约 2 秒生效）', 'ok');
+    }
+    setTimeout(() => refreshStatus(), 2500);
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+/* 修改访问密钥（API Key，可自定义密码） */
+async function changeApiKey() {
+  openModal(`
+    <h3>🔑 修改访问密钥（API Key / 密码）</h3>
+    <p class="hint">客户端连接本代理用的密码。留空则自动生成随机 key；保存后立即生效，旧客户端需改用新 key。</p>
+    <div class="form-grid">
+      <label>新密钥<input id="newKey" placeholder="留空 = 随机生成"></label>
+    </div>
+    <div class="m-actions">
+      <button class="btn" id="ckCancel">取消</button>
+      <button class="btn primary" id="ckSave">保存</button>
+    </div>`);
+  $('#ckCancel').onclick = closeModal;
+  $('#ckSave').onclick = async () => {
+    let nk = $('#newKey').value.trim();
+    if (!nk) nk = 'sk-' + Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
+    try {
+      await api('/admin/api/settings', { method: 'PUT', body: { apiKey: nk } });
+      closeModal();
+      try { await navigator.clipboard.writeText(nk); toast(`密钥已更新并复制到剪贴板：${nk}（旧客户端需改用新 key）`, 'ok'); }
+      catch (e) { toast(`密钥已更新：${nk}（旧客户端需改用新 key）`, 'ok'); }
+      setTimeout(() => refreshStatus(), 1500);
+    } catch (e) { toast(e.message, 'err'); }
+  };
+}
 
 /* ============ Provider 管理 ============ */
 let providersCache = null;   // GET /admin/api/providers
@@ -248,7 +298,7 @@ async function renderProviders() {
       const probe = status && status.providers.find(x => x.name === p.name);
       const pc = p.enabled === false ? '—' : (probe && probe.probe ? (probe.probe.ok ? '✅' : '❌') : '·');
       const statusTag = p.enabled === false
-        ? (p.disabledBy === 'auto' ? ' <span class="tag tag-bad">已踢出</span>' : ' <span class="tag tag-muted">已停用</span>')
+        ? (p.disabledBy === 'auto' ? ' <span class="tag tag-bad">已踢出</span>' : p.disabledBy === 'quota' ? ' <span class="tag tag-warn">限流停用</span>' : ' <span class="tag tag-muted">已停用</span>')
         : '';
       const insecure = /^http:\/\//.test(p.baseUrl) ? ' ⚠️<span class="hint">明文</span>' : '';
       const pi = prio.indexOf(p.name);
@@ -391,6 +441,7 @@ function openProviderModal(name) {
         <button id="fFetch" class="btn">🔍 自动获取模型列表（用上方地址和 key）</button>
         <span class="hint" id="fFetchNote"></span>
       </div>
+      <div id="fCheckboxArea" class="f-model-list" style="display:none"></div>
       <label>别名映射（统一别名 → 该站真实模型名）
         <div id="fAliasRows">${aliases.map(([k, v]) => aliasRowHtml(k, v)).join('') || '<span class="hint">无</span>'}</div>
         <button id="fAddAlias" class="btn sm" type="button">＋ 加一行</button>
@@ -421,8 +472,32 @@ function openProviderModal(name) {
         body: { baseUrl: $('#fBase').value.trim(), key: $('#fKey').value.trim(), name: p ? p.name : undefined },
       });
       if (r.ok) {
-        $('#fModels').value = r.models.join('\n');
-        $('#fFetchNote').innerHTML = `✅ 获取到 <b>${r.count}</b> 个模型${r.count > 50 ? '（较多可手动删减）' : ''}`;
+        // 渲染可滑动勾选列表 + 全选/取消全选按钮
+        const area = $('#fCheckboxArea');
+        area.innerHTML =
+          `<div style="display:flex;gap:8px;padding:6px 10px;border-bottom:2px solid var(--border);position:sticky;top:0;background:var(--card);z-index:1">
+            <button class="btn sm" id="fSelectAll">全选</button>
+            <button class="btn sm" id="fDeselectAll">取消全选</button>
+            <span class="hint" style="margin-left:auto;align-self:center">已选 <b id="fSelCount">${r.count}</b> / ${r.count}</span>
+          </div>` +
+          r.models.map((m, idx) =>
+            `<label class="f-model-row"><input type="checkbox" class="f-model-cb" checked data-idx="${idx}"> <span class="mono">${escapeHtml(m)}</span><span class="hint" style="margin-left:auto">#${idx + 1}</span></label>`
+          ).join('');
+        area.style.display = 'block';
+        const updateCount = () => {
+          const total = area.querySelectorAll('.f-model-cb').length;
+          const sel = area.querySelectorAll('.f-model-cb:checked').length;
+          $('#fSelCount').textContent = sel;
+        };
+        const syncToTextarea = () => {
+          const checked = [...area.querySelectorAll('.f-model-cb:checked')].map(c => r.models[parseInt(c.dataset.idx)]);
+          const manual = $('#fModels').value.split('\n').map(s => s.trim()).filter(s => s && !r.models.includes(s));
+          $('#fModels').value = [...checked, ...manual].join('\n');
+        };
+        area.addEventListener('change', () => { updateCount(); syncToTextarea(); });
+        $('#fSelectAll').onclick = () => { area.querySelectorAll('.f-model-cb').forEach(cb => cb.checked = true); updateCount(); syncToTextarea(); };
+        $('#fDeselectAll').onclick = () => { area.querySelectorAll('.f-model-cb').forEach(cb => cb.checked = false); updateCount(); syncToTextarea(); };
+        $('#fFetchNote').innerHTML = `✅ 获取到 <b>${r.count}</b> 个模型`;
       } else {
         $('#fFetchNote').textContent = `❌ ${r.error || r.err}`;
       }
@@ -518,6 +593,11 @@ function renderChat() {
   const streaming = assistantAbort !== null; // 流式中
   box.innerHTML = chatStore.map((m, idx) => {
     if (m.role === 'sysline') return `<div class="sysline">${escapeHtml(m.content)}</div>`;
+    // 工具结果虽以 user 角色注入（便于回传 AI），但不是用户发言：渲染成可折叠的系统块，不占用户气泡
+    if (m.role === 'user' && String(m.content).startsWith('[系统工具结果]')) {
+      const payload = String(m.content).slice('[系统工具结果]'.length).trim();
+      return `<details class="tool-result"><summary>🔧 工具结果</summary><pre>${escapeHtml(payload)}</pre></details>`;
+    }
     const body = m.role === 'assistant' ? renderMarkdown(m.content) : escapeHtml(m.content);
     const cursor = (streaming && idx === chatStore.length - 1 && m.role === 'assistant') ? '<span class="cursor-blink">▍</span>' : '';
     return `<div class="msg ${m.role}"><div class="who">${m.role === 'user' ? '我' : '助手'}</div><div class="body">${body}${cursor}</div></div>`;
@@ -658,10 +738,19 @@ $('#asSave').onclick = async () => {
   } catch (e) { toast(e.message, 'err'); }
 };
 
-// 从 URL 提取站名（域名第一部分）
+// 从 URL 提取站名：取域名里最有辨识度的一段（跳过 api/www/v1 等通用前缀），
+// 避免 api.xiaomimimo.com、api.openai.com 都被取成 "api" 而重名
 function extractName(url) {
   const m = String(url || '').match(/https?:\/\/([^\/]+)/);
-  return m ? m[1].split('.')[0] : 'new-site';
+  if (!m) return 'new-site';
+  const parts = m[1].split('.').filter(Boolean);
+  if (parts.length <= 1) return parts[0] || 'new-site';
+  const generic = new Set(['api', 'www', 'app', 'gateway', 'gw', 'proxy', 'openai', 'v1', 'chat']);
+  // 去掉末尾 TLD（com/cn/net/org/io/ai 等），从剩余里挑第一个非通用词
+  const tlds = new Set(['com', 'cn', 'net', 'org', 'io', 'ai', 'co', 'top', 'app', 'dev', 'xyz']);
+  const body = parts[parts.length - 1] && tlds.has(parts[parts.length - 1]) ? parts.slice(0, -1) : parts;
+  const pick = body.find(x => !generic.has(x.toLowerCase()));
+  return pick || body[body.length - 1] || body[0] || 'new-site';
 }
 
 // 发送对话
@@ -790,11 +879,16 @@ async function consolidateChat(history, silent) {
 }
 function maybeAutoConsolidate() {
   const newMsgs = chatStore.slice(lastConsolidatedIndex).filter(m => m.role === 'user' || m.role === 'assistant');
-  const newUserCount = chatStore.slice(lastConsolidatedIndex).filter(m => m.role === 'user').length;
-  if (newUserCount >= 10) {
+  // 只统计「真实用户发言」：工具执行结果虽然以 user 角色注入（便于回传给 AI），但不是用户说的话，
+  // 不能计入巩固触发计数——否则用户一句话触发 2-3 次工具往返就被当成 6 轮，过早巩固几乎没内容的对话
+  const newUserCount = chatStore.slice(lastConsolidatedIndex)
+    .filter(m => m.role === 'user' && !String(m.content).startsWith('[系统工具结果]')).length;
+  // 满 6 轮真实用户发言即巩固一次（原为 10，偏晚：长对话里前面的要点容易被 20 条历史窗口挤掉没记进记忆）
+  if (newUserCount >= 6) {
     lastConsolidatedIndex = chatStore.length; // 先记索引，防并发重复触发
     consolidateChat(newMsgs, true).then(ok => {
       if (ok) { persistChat(); renderChat(); refreshMemory(); }
+      else { lastConsolidatedIndex = Math.max(0, chatStore.length - newMsgs.length); } // 失败回退索引，下轮重试
     });
   }
 }
@@ -857,34 +951,64 @@ async function streamAssistant(history) {
   return interrupted ? aiMsg.content + '\n[[INTERRUPTED]]' : aiMsg.content;
 }
 
-/* 回复后处理：记忆块 + 工具块 + 提案卡 */
+/* 从文本里扫出所有「完整平衡」的 JSON 对象（跳过字符串内的花括号，容忍嵌套/转义）。
+   比正则 [^}]* 稳健：工具参数带嵌套对象或值里含 } 时不会被截断。*/
+function scanJsonObjects(text) {
+  const out = [];
+  const s = String(text || '');
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] !== '{') continue;
+    let depth = 0, inStr = false, esc = false, end = -1;
+    for (let j = i; j < s.length; j++) {
+      const ch = s[j];
+      if (esc) { esc = false; continue; }
+      if (ch === '\\') { esc = true; continue; }
+      if (ch === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (ch === '{') depth++;
+      else if (ch === '}') { depth--; if (depth === 0) { end = j; break; } }
+    }
+    if (end < 0) break; // 未闭合：后面不会再有完整对象
+    const chunk = s.slice(i, end + 1);
+    try { out.push({ obj: JSON.parse(chunk), raw: chunk }); } catch (e) {}
+    i = end; // 跳过已消费部分
+  }
+  return out;
+}
+
+/* 回复后处理：记忆块 + 工具块（可多个） + 提案卡 */
 async function handleAssistantReply(fullText) {
   // 中断的半截回复不解析块（防误存记忆/误弹提案）
   if (fullText.includes('[[INTERRUPTED]]')) return;
 
-  // 记忆块（每轮最多1条）
-  const memMatch = fullText.match(/^\{"memory":\{"remember":"(.+?)"\}\}\s*$/m);
-  if (memMatch) {
-    try {
-      await api('/admin/api/memory', { method: 'PUT', body: { op: 'addPreference', text: memMatch[1] } });
-      chatStore.push({ role: 'sysline', content: `🧠 助手记住了：「${memMatch[1]}」` });
-      renderChat();
-    } catch (e) {}
+  const objs = scanJsonObjects(fullText);
+
+  // 记忆块：{"memory":{"remember":"..."}}（引号安全，不再要求独占一行）
+  for (const { obj } of objs) {
+    const remember = obj && obj.memory && obj.memory.remember;
+    if (remember) {
+      try {
+        await api('/admin/api/memory', { method: 'PUT', body: { op: 'addPreference', text: String(remember) } });
+        chatStore.push({ role: 'sysline', content: `🧠 助手记住了：「${remember}」` });
+        renderChat();
+      } catch (e) {}
+      break; // 每轮最多存一条
+    }
   }
 
-  // 工具块（AI 要求执行本地工具，执行后回传结果再总结）
-  const toolMatch = fullText.match(/\{"tool":"[a-z-]+"[^}]*\}/);
-  if (toolMatch) {
-    let args = {};
-    try { args = JSON.parse(toolMatch[0]); } catch (e) {}
-    const handler = toolHandlers[args.tool];
-    if (handler) {
-      await handler(args);
-    } else {
-      chatStore.push({ role: 'sysline', content: `⚠️ 未知工具：${args.tool || toolMatch[0]}` });
-      renderChat();
+  // 工具块：{"tool":"..."}（支持一轮里多个工具，按出现顺序依次执行）
+  const toolObjs = objs.filter(({ obj }) => obj && typeof obj.tool === 'string');
+  if (toolObjs.length) {
+    for (const { obj } of toolObjs) {
+      const handler = toolHandlers[obj.tool];
+      if (handler) {
+        await handler(obj);
+      } else {
+        chatStore.push({ role: 'sysline', content: `⚠️ 未知工具：${obj.tool}` });
+        renderChat();
+      }
     }
-    return;
+    return; // 工具执行后由 runTool 内部回传结果续聊，不再解析提案
   }
 
   // json 提案块（支持多个）
@@ -911,7 +1035,7 @@ function sleep(ms) { return new Promise(res => setTimeout(res, ms)); }
 /* 通用工具执行：取结果 → 回传给 AI 总结（带递归深度限制） */
 let toolDepth = 0;
 async function runTool(label, fetchResult) {
-  if (toolDepth >= 3) {
+  if (toolDepth >= 6) {
     chatStore.push({ role: 'sysline', content: '⚠️ 工具调用过多已停止，请改用手动操作' });
     renderChat();
     return;
@@ -948,8 +1072,13 @@ async function runStatusTool() {
 async function runProbeTool() {
   await runTool('正在探测全部站点', async () => {
     await api('/admin/api/probe', { method: 'POST', body: { name: 'all' } });
-    await sleep(9000);
-    const s = await api('/admin/api/status');
+    // 轮询直到所有站探完（busy 全部消失）或超时 25s，替代固定 sleep 9s（站少不空等、站多不早退）
+    let s;
+    for (let i = 0; i < 25; i++) {
+      await sleep(1000);
+      s = await api('/admin/api/status');
+      if (!s.providers.some(p => p.probe && p.probe.busy)) break;
+    }
     return s.providers.map(p => {
       const pr = p.probe;
       const st = !pr ? '未测' : pr.busy ? '探测中' : pr.ok ? `通（${pr.ms}ms）` : `不通（${pr.err}）`;
@@ -1042,14 +1171,15 @@ async function runCheckTool(args) {
   await runTool(`正在检测${type === 'model' ? '模型 ' : '站点 '}${target}`, async () => {
     const r = await api('/admin/api/check', { method: 'POST', body: { type: type || 'site', target } });
     if (r.type === 'model') {
-      const lines = r.results.map(x => `${x.provider}：${x.ok ? `通（${x.ms}ms，真实模型 ${x.realModel}）` : `不通（${x.err}）`}`);
-      return `模型 ${target} 在 ${r.results.length} 个站的情况：\n${lines.join('\n')}`;
+      const lines = r.results.map(x => `${x.provider}：已配置（真实模型 ${x.realModel}${x.note ? '，' + x.note : ''}）`);
+      return `模型 ${target} 配置在 ${r.results.length} 个站：\n${lines.join('\n')}`;
     }
     return r.ok ? `站点 ${target} 连通，延迟 ${r.ms}ms` : `站点 ${target} 不通：${r.err}`;
   });
 }
 
 /* 提案渲染与应用 */
+function normUrl(u) { return String(u || '').trim().replace(/\/+$/, '').toLowerCase(); }
 async function addProposals(ops) {
   // baseUrl 幻觉校验：必须出现在用户历史消息中
   const userTexts = chatStore.filter(x => x.role === 'user').map(x => x.content).join('\n');
@@ -1060,7 +1190,12 @@ async function addProposals(ops) {
   for (const op of ops) {
     const p = op.provider || {};
     const exists = providersNow.find(x => x.name === p.name);
-    const urlOk = !p.baseUrl || userTexts.includes(p.baseUrl) || userTexts.includes(p.baseUrl.replace(/\/+$/, ''));
+    // baseUrl 幻觉校验：出现在用户消息中 OK；或与「已存在同名站」的现有 baseUrl 一致也 OK
+    // （update/delete 已有站时，AI 按协议回带原 baseUrl，它本就不在本轮聊天里，不能当编造拦掉——否则改别名/改模型全被禁用）
+    const urlOk = !p.baseUrl
+      || userTexts.includes(p.baseUrl)
+      || userTexts.includes(p.baseUrl.replace(/\/+$/, ''))
+      || (exists && normUrl(exists.baseUrl) === normUrl(p.baseUrl));
     const card = document.createElement('div');
     card.className = 'proposal';
     card.dataset.name = p.name || '';

@@ -1,10 +1,25 @@
-"providers.json"  
-"settings.json"  
-"memory.json"  
-"stats.json"  
-"logs/"  
-"run-state-*.json"  
-"heartbeat-*.txt"  
-"tray-cmd-*.txt"  
-"*.tmp"  
-"*.bak*"  
+# 含 key 的数据文件绝不进版本历史
+providers.json
+providers.json.bak
+providers.json.bak1
+providers.json.bak2
+providers.json.bak3
+settings.json
+memory.json
+memory.json.broken-*
+stats.json
+logs/
+run-state-*.json
+heartbeat-*.txt
+tray-cmd-*.txt
+*.tmp
+*.broken-*
+icon.ico
+旧站key存档*.txt
+# 快照目录（git 上线后无需目录快照）与构建产物
+versions/
+dist/
+
+# DSW 鍕挜鐣欐畫鑴氭湰锛堟湰鍦板伐叿锛屼笉鍏ュ簲寮€搴擄級
+s36*.sh
+tunnel_all.sh

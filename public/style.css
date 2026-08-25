@@ -267,6 +267,10 @@ textarea:focus-visible, select:focus-visible {
 .copy-btn { cursor: pointer; }
 
 .sysline { text-align: center; color: var(--muted); font-size: var(--fs-xs); margin: var(--sp-2) 0; }
+.tool-result { margin: var(--sp-2) 0; border: 1px solid var(--border); border-radius: 8px; background: rgba(127,127,127,.06); overflow: hidden; }
+.tool-result > summary { cursor: pointer; padding: 6px 10px; font-size: var(--fs-xs); color: var(--muted); user-select: none; }
+.tool-result > summary:hover { color: var(--text); }
+.tool-result > pre { margin: 0; padding: 8px 10px; border-top: 1px solid var(--border); font-size: var(--fs-xs); white-space: pre-wrap; word-break: break-word; color: var(--text); max-height: 240px; overflow-y: auto; }
 .chat-input-row { display: flex; gap: var(--sp-2); margin-top: 10px; }
 .chat-input-row textarea { flex: 1; resize: vertical; }
 .key-note {
@@ -349,6 +353,27 @@ textarea:focus-visible, select:focus-visible {
 .modal .m-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: var(--sp-4); }
 .alias-row { display: grid; grid-template-columns: 1fr 24px 1fr 30px; gap: 6px; margin-bottom: 6px; align-items: center; }
 .alias-row .eq { text-align: center; color: var(--muted); }
+/* 模型勾选滑动列表 */
+.f-model-list {
+  display: block !important;
+  max-height: 220px; overflow-y: auto;
+  border: 1px solid var(--border); border-radius: var(--r-md);
+}
+.f-model-row {
+  display: flex !important; width: 100% !important;
+  align-items: center; gap: 8px;
+  padding: 5px 10px; cursor: pointer;
+  border-bottom: 1px solid var(--border);
+  transition: background .12s;
+  font-size: var(--fs-sm);
+  color: var(--text);
+  box-sizing: border-box;
+}
+.f-model-row:last-child { border-bottom: none; }
+.f-model-row:hover { background: var(--hover); }
+.f-model-row input[type="checkbox"] { accent-color: var(--primary); flex-shrink: 0; width: 16px; height: 16px; }
+.f-model-row .mono { font-family: Consolas, monospace; word-break: break-all; flex: 1; min-width: 0; color: var(--text); }
+.f-model-row .hint { margin-left: auto; flex-shrink: 0; color: var(--muted); }
 
 /* ============ 键值状态卡 ============ */
 .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: var(--fs-sm); }

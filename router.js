@@ -9,12 +9,12 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
 const APP_DIR = __dirname;
 const TAG = process.env.RP_PORT && process.env.RP_PORT !== '3099' ? process.env.RP_PORT : 'main';
 const MY_PORT = parseInt(process.env.RP_PORT || '3099', 10);
-const HOST = '127.0.0.1';
-const UPSTREAM_TIMEOUT = 60000;
+const UPSTREAM_TIMEOUT = 30000;
 const startedAt = Date.now();
 
 // 全局未捕获异常处理：防止任何遗漏的 Promise rejection 导致进程退出（Node 15+ 默认行为）
@@ -67,6 +67,7 @@ let settings = {
   probeIntervalMin: 30,
   autoKick: true,       // 废站自动踢（探活3连败+复验确认）
   smartRouting: true,   // 动态选最快站（false 回退固定优先级）
+  bindLan: false,       // 局域网访问开关（true 监听 0.0.0.0，同 WiFi 设备可访问；false 仅监听 127.0.0.1）
 };
 try {
   settings = { ...settings, ...JSON.parse(fs.readFileSync(settingsPath, 'utf-8')) };
@@ -86,6 +87,7 @@ fs.watchFile(settingsPath, { interval: 1000 }, () => {
       const fresh = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
       settings = { ...settings, ...fresh };
       scheduleProbe();
+      applyBindLan(); // bindLan 开关变化 → 运行时切换监听地址
       console.log(`\n⚙️ settings 已热加载: apiKey=*** 优先级=${(settings.priority || []).length} 项\n`);
     } catch (e) {
       console.log(`\n❌ settings 热加载失败（保留旧配置）: ${e.message}\n`);
@@ -95,6 +97,74 @@ fs.watchFile(settingsPath, { interval: 1000 }, () => {
 
 function configMtime() {
   try { return fs.statSync(configPath).mtimeMs; } catch (e) { return 0; }
+}
+
+// ============ 监听地址（bindLan 局域网访问开关） ============
+let currentHost = settings.bindLan === true ? '0.0.0.0' : '127.0.0.1';
+function desiredHost() { return settings.bindLan === true ? '0.0.0.0' : '127.0.0.1'; }
+// 取局域网 IPv4：优先私有段（家用/办公 WiFi 的 192.168 / 10 / 172.16-31），
+// 排除 2.0.0.1、169.254.x.x 这类虚拟网卡/隧道地址（否则同 WiFi 设备拿到错 IP 连不上）
+function lanIPv4() {
+  try {
+    const ifs = os.networkInterfaces();
+    const all = [];
+    for (const name of Object.keys(ifs)) {
+      for (const it of ifs[name] || []) {
+        if (it.family === 'IPv4' && !it.internal) all.push(it.address);
+      }
+    }
+    if (!all.length) return null;
+    const priv192 = all.find(ip => ip.startsWith('192.168.'));
+    if (priv192) return priv192;
+    const priv10 = all.find(ip => ip.startsWith('10.'));
+    if (priv10) return priv10;
+    const priv172 = all.find(ip => /^172\.(1[6-9]|2[0-9]|3[01])\./.test(ip));
+    if (priv172) return priv172;
+    return all[0]; // 无私有段时回退（纯隧道/云环境）
+  } catch (e) {}
+  return null;
+}
+function accessBaseUrl() {
+  const host = currentHost === '0.0.0.0' ? (lanIPv4() || '127.0.0.1') : '127.0.0.1';
+  return `http://${host}:${MY_PORT}`;
+}
+let server = null; // http.Server 实例（createServer 处赋值，供 applyBindLan 重绑监听）
+let rebinding = false; // 切换进行中标志：串行化 close→listen，防止并发 listen 触发 ERR_SERVER_ALREADY_LISTEN
+let pendingHost = null; // 切换期间积累的最新目标，当前切换完成后继续串行处理
+function applyBindLan() {
+  if (!server) return; // 尚未创建/监听
+  const want = desiredHost();
+  if (want === currentHost) { if (!rebinding) pendingHost = null; return; }
+  if (rebinding) { pendingHost = want; return; }
+  doRebind(want);
+}
+function doRebind(want) {
+  rebinding = true;
+  const from = currentHost === '0.0.0.0' ? '局域网可访问' : '仅本机';
+  currentHost = want;
+  console.log(`\n🌐 监听地址切换: ${from} → ${want === '0.0.0.0' ? '局域网可访问' : '仅本机'} (${want}:${MY_PORT})\n`);
+  const handleError = (err) => {
+    server.removeListener('error', handleError);
+    rebinding = false;
+    pendingHost = null;
+    console.log(`  ⚠️ 重绑监听失败: ${err && (err.code || err.message)}（服务可能停摆，请重启恢复）`);
+  };
+  server.close(() => {
+    server.on('error', handleError);   // listen 失败兜底（EADDRINUSE 等）
+    server.listen(MY_PORT, currentHost, () => {
+      server.removeListener('error', handleError);
+      rebinding = false;
+      console.log(`✅ 已重新监听 ${currentHost}:${MY_PORT}`);
+      if (pendingHost && pendingHost !== currentHost) {   // 切换期间又积累了新目标 → 继续串行切换
+        const next = pendingHost;
+        pendingHost = null;
+        doRebind(next);
+      }
+    });
+  });
+  // 停止接受新连接后尽快释放旧连接，使 close 回调及时触发（切换瞬间中断进行中的流式请求可接受）
+  if (typeof server.closeAllConnections === 'function') setTimeout(() => { try { server.closeAllConnections(); } catch (e) {} }, 200);
+  else if (typeof server.closeIdleConnections === 'function') server.closeIdleConnections();
 }
 
 // ============ providers 热加载 ============
@@ -172,6 +242,104 @@ function markProviderSuccess(providerName) {
   if (providerHealth[providerName]) {
     providerHealth[providerName].failures = 0;
   }
+  provider5xx[providerName] = { streak: 0, until: 0 };
+  if (provider429[providerName]) provider429[providerName].streak = 0; // 成功一次即清零 429 连击
+}
+
+// ============ 429 限流提醒 + 自动停用/午夜恢复 ============
+// 提醒：连续 5 次 429 弹一次通知（10 分钟冷却防刷屏）。
+// 停用：当天累计提醒 2 次 → 自动停用该站（额度已用尽，不再白白重试）。
+// 恢复：每晚 0 点自动恢复被限流停用的站，并重置当天提醒计数。
+const provider429 = {};                    // name -> { streak, lastNotify, notifyCount }
+const R429_STREAK_THRESHOLD = 5;           // 连续 5 次 429 触发提醒
+const R429_NOTIFY_COOLDOWN = 10 * 60 * 1000; // 同一站 10 分钟内最多提醒一次（防刷屏）
+const R429_SUSPEND_AFTER = 2;              // 当天累计提醒达 2 次 → 停用
+function markProvider429(providerName) {
+  const s = provider429[providerName] || (provider429[providerName] = { streak: 0, lastNotify: 0, notifyCount: 0 });
+  s.streak++;
+  if (s.streak >= R429_STREAK_THRESHOLD && Date.now() - s.lastNotify > R429_NOTIFY_COOLDOWN) {
+    s.lastNotify = Date.now();
+    s.notifyCount++;
+    const msg = `站点 ${providerName} 连续限流（429），提醒 ${s.notifyCount}/${R429_SUSPEND_AFTER} 次，可能已达免费额度上限`;
+    console.log(`  ⏳ ${msg}`);
+    sendNotify(msg);
+    addChangelog('自动', msg);
+    if (s.notifyCount >= R429_SUSPEND_AFTER) suspendProviderForQuota(providerName);
+  }
+}
+
+// 停用限流站：enabled=false + disabledBy:'quota'（与 auto踢/手动停用区分），记录停用日期供午夜恢复判断
+async function suspendProviderForQuota(name) {
+  try {
+    const list = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    const item = list.find(x => x.name === name);
+    if (!item || item.enabled === false) return; // 已停用则不重复处理
+    item.enabled = false;
+    item.disabledBy = 'quota';
+    item.quotaSuspendedAt = todayKey();
+    if (PROVIDERS[name]) PROVIDERS[name].enabled = false; // 同步内存（不等热加载）
+    const err = writeProviders(list);
+    if (err) { console.log(`限流停用 ${name} 写入失败: ${err}`); return; }
+    computeProviderScore(name);
+    addChangelog('自动', `限流提醒达 ${R429_SUSPEND_AFTER} 次，停用 ${name}（今晚 0 点自动恢复）`);
+    sendNotify(`站点 ${name} 因连续限流已暂时停用，今晚 0 点后自动恢复`);
+    console.log(`  ⏸️ 已限流停用: ${name}（今晚 0 点恢复）`);
+  } catch (e) { console.log(`限流停用 ${name} 出错: ${e.message}`); }
+}
+
+// 午夜/启动时恢复：只恢复「停用日期早于今天」的限额站（避免同一天内重启误恢复当天刚停的站）
+function restoreQuotaSuspended() {
+  try {
+    const today = todayKey();
+    const list = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    const restored = [];
+    for (const item of list) {
+      if (item.disabledBy === 'quota' && item.enabled === false && item.quotaSuspendedAt && item.quotaSuspendedAt !== today) {
+        item.enabled = true;
+        delete item.disabledBy;
+        delete item.quotaSuspendedAt;
+        if (PROVIDERS[item.name]) PROVIDERS[item.name].enabled = true;
+        restored.push(item.name);
+      }
+    }
+    if (restored.length) {
+      writeProviders(list);
+      for (const n of restored) computeProviderScore(n);
+      addChangelog('自动', `已过 0 点，恢复限流停用的站点：${restored.join('、')}`);
+      sendNotify(`🌙 已恢复限流停用的站点：${restored.join('、')}`);
+      console.log(`  🌙 已恢复限流停用站点: ${restored.join('、')}`);
+    }
+    // 重置当天 429 提醒计数（新的一天重新累计）
+    for (const k of Object.keys(provider429)) provider429[k] = { streak: 0, lastNotify: 0, notifyCount: 0 };
+  } catch (e) { console.log(`恢复限流站出错: ${e.message}`); }
+}
+
+// 安排下次午夜触发（本地时区次日 0 点 + 1 秒保险）
+function scheduleMidnightReset() {
+  const now = new Date();
+  const mid = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 1);
+  const ms = mid.getTime() - now.getTime();
+  setTimeout(() => { restoreQuotaSuspended(); scheduleMidnightReset(); }, ms).unref();
+}
+
+// ============ 5xx 熔断（抗「假活站」：探活 GET /models 通、但 POST 请求全 5xx） ============
+// 探活基于 /models（GET），抓不到只有对话请求才 503 的站；这里对连续 5xx 的站临时冷却，
+// 冷却期内评分打到极低（在候选排序里自动垫底），避免每次请求都再撞一次死站。
+const provider5xx = {};                 // name -> { streak, until }
+const SXX_STREAK_THRESHOLD = 3;         // 连续 3 次 5xx 触发冷却
+const SXX_COOLDOWN_MS = 3 * 60 * 1000;  // 冷却 3 分钟
+function markProvider5xx(providerName) {
+  const s = provider5xx[providerName] || (provider5xx[providerName] = { streak: 0, until: 0 });
+  s.streak++;
+  if (s.streak >= SXX_STREAK_THRESHOLD) {
+    s.until = Date.now() + SXX_COOLDOWN_MS;
+    console.log(`  🧯 ${providerName} 连续 ${s.streak} 次 5xx，冷却 ${SXX_COOLDOWN_MS / 60000} 分钟`);
+  }
+  computeProviderScore(providerName);
+}
+function is5xxCooling(providerName) {
+  const s = provider5xx[providerName];
+  return !!(s && s.until && Date.now() < s.until);
 }
 
 // ============ 原子写与托盘通知 ============
@@ -194,11 +362,13 @@ try {
 function shouldFailover(statusCode, body) {
   if (statusCode === 400 || statusCode === 401 || statusCode === 402 || statusCode === 403 || statusCode === 424 || statusCode === 429) return true;
   if (statusCode === 404) return true;
+  // 5xx 一律换站：上游服务端错误（502/503/500 等）不管 body 有没有关键词都该转移，
+  // 否则像干巴巴 503 这种会被当作「不可转移」原样返回，导致死磕同一个挂掉的站
+  if (statusCode >= 500) return true;
   const text = (body || '').toLowerCase();
   const keywords = ['quota', 'insufficient', 'balance', 'payment required', 'rate limit',
     'over quota', '额度', '余额', '付款', '超出', '限流', 'no available channel',
     'service temporarily unavailable', 'unavailable', 'model not found', 'model_not_found'];
-  if (statusCode >= 500 && keywords.some(kw => text.includes(kw))) return true;
   return keywords.some(kw => text.includes(kw));
 }
 
@@ -345,6 +515,8 @@ function computeProviderScore(name) {
     }
     // ④ 探活不通：总分 ×0.3 封顶（刚挂的站不被历史高分误选）
     if (probe && !probe.busy && !probe.ok) { score *= 0.3; detail.push('探活挂×0.3'); }
+    // ⑤ 5xx 冷却中：探活可能仍绿（GET /models 通），但对话请求全 5xx，直接压到极低分垫底
+    if (is5xxCooling(name)) { score = Math.min(score, 1); detail.push('5xx冷却'); }
     providerScores[name] = { score: Math.round(score), detail: detail.join(' '), ms: lat == null ? null : Math.round(lat) };
   } catch (e) {
     providerScores[name] = { score: 0, detail: '评分出错' };
@@ -529,7 +701,7 @@ function httpGetJson(url, headers, timeoutMs) {
     const started = Date.now();
     const req = transport.get(url, { headers, timeout: timeoutMs }, (res) => {
       let data = '';
-      res.on('data', c => { data += c; if (data.length > 500000) req.destroy(); });
+      res.on('data', c => { data += c; if (data.length > 10000000) req.destroy(); }); // 10MB 上限，容纳 OpenRouter 690KB 大站列表
       res.on('end', () => resolve({ ok: res.statusCode === 200, status: res.statusCode, ms: Date.now() - started, body: data }));
       res.resume();
     });
@@ -598,8 +770,8 @@ function normalizeBase(url) {
 async function sniffModels(rawBase, key) {
   const b = normalizeBase(rawBase);
   if (!/^https?:\/\//.test(b)) return { ok: false, err: '地址必须以 http:// 或 https:// 开头' };
-  const paths = [b + '/v1/models'];
-  if (/\/v\d+$/.test(b)) paths.push(b + '/models');
+  // 路径候选：baseUrl 含 /v1（如 https://openrouter.ai/api/v1）时优先 b+/models，避免拼出 /v1/v1 双拼
+  const paths = /\/v\d+$/.test(b) ? [b + '/models', b + '/v1/models'] : [b + '/v1/models', b + '/models'];
   let lastStatus = 0, lastErr = '';
   for (const u of paths) {
     const r = await httpGetJson(u, { Authorization: `Bearer ${key}` }, 12000);
@@ -717,7 +889,7 @@ const ASSISTANT_SYSTEM = `你是「中转站配置助手」，服务于运行在
 
 ## 可用工具
 只有当用户明确要求执行操作（检测/查询/测试/调整/启停等）时才调用工具；普通问题直接用文字回答，不要为了"显得有用"而主动调用工具。
-调用时：先一句话说明要做什么，再在回复末尾单独一行输出工具块（系统执行后把结果回传，你再据此总结）。工具块必须单独成行：
+调用时：先一句话说明要做什么，再在回复末尾输出工具块（系统执行后把结果回传，你再据此总结）。需要连续做多件事时，可以一次输出多个工具块（每个单独成行，按顺序执行）：
 - 查询模型的配置情况（type: model 查该模型配置在哪些站、别名映射；site 查站点连通；target 填站名或模型名。注意：只查配置和探活结果，不发测试对话，禁止向用户声称"实测"）：{"tool":"check","type":"model","target":"glm-5.2"}
 - 查看服务状态（哪些站挂了、可用/推荐模型、重启次数）：{"tool":"status"}
 - 探测全部站点连通性：{"tool":"probe"}
@@ -878,6 +1050,23 @@ function extractJSON(text) {
   return JSON.parse(t);
 }
 
+// 长期记忆近似去重：精确相同，或新事实与旧事实互为子串（近义扩写/缩写，取较长者留存）
+function isDuplicateFact(fact) {
+  const norm = s => String(s || '').replace(/\s+/g, '').toLowerCase();
+  const nf = norm(fact);
+  if (!nf) return true;
+  for (const x of memory.longterm) {
+    const nx = norm(x.fact);
+    if (nx === nf) return true;
+    if (nx.length >= 8 && nf.length >= 8 && (nx.includes(nf) || nf.includes(nx))) {
+      // 新的更长 → 用新的替换旧的（保留信息量更大的版本），并视为已存在
+      if (nf.length > nx.length) x.fact = fact;
+      return true;
+    }
+  }
+  return false;
+}
+
 // 巩固：把一段对话总结成日记 + 长期记忆（失败返回 ok:false，不阻塞调用方）
 async function handleConsolidate(req, res, body) {
   let parsed;
@@ -906,7 +1095,7 @@ async function handleConsolidate(req, res, body) {
       for (const item of result.longterm) {
         if (!item || !item.fact) continue;
         const fact = String(item.fact);
-        if (memory.longterm.some(x => x.fact === fact)) continue; // 去重
+        if (isDuplicateFact(fact)) continue; // 近似去重：精确相同 / 一方包含另一方
         memory.longterm.push({
           time: new Date().toLocaleString('zh-CN', { hour12: false }),
           fact,
@@ -1139,7 +1328,9 @@ async function handleAdmin(req, res, reqUrl) {
       kickedCount: providerList.filter(p => p.disabledBy === 'auto').length,
       providers,
       runState: readRunState(),
-      baseUrl: `http://${HOST}:${MY_PORT}/v1`,
+      baseUrl: `${accessBaseUrl()}/v1`,
+      bindLan: settings.bindLan === true,
+      lanIP: currentHost === '0.0.0.0' ? (lanIPv4() || '') : '',
       apiKeyMasked: maskKey(settings.apiKey),
       assistant: { baseUrl: a.baseUrl, keyMasked: maskKey(a.key), model: a.model || '' },
       probeIntervalMin: settings.probeIntervalMin,
@@ -1399,8 +1590,8 @@ setInterval(() => {
 
 // ============ HTTP 代理主服务 ============
 let clientSeq = 0;
-const server = http.createServer((req, res) => {
-  const reqUrl = new URL(req.url, `http://${HOST}:${MY_PORT}`);
+server = http.createServer((req, res) => {
+  const reqUrl = new URL(req.url, `http://${currentHost}:${MY_PORT}`);
   const reqPath = reqUrl.pathname;
   const method = req.method;
 
@@ -1505,6 +1696,7 @@ const server = http.createServer((req, res) => {
         result = await sendRequest(opts, targetBody);
       } catch (e) {
         markProviderFailed(cand.provider);
+        markProvider5xx(cand.provider); // 网络错误/超时同样计入 5xx 熔断
         console.log(`  ✗ ${cand.provider} 网络错误: ${e.message}`);
         recordAttempt(modelName, cand.provider, Date.now() - t0, 502, false, false, null);
         lastError = { statusCode: 502, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: { message: `${cand.provider}: ${e.message}`, type: 'proxy_error' } }) };
@@ -1585,6 +1777,8 @@ const server = http.createServer((req, res) => {
 
       if (shouldFailover(result.statusCode, result.body)) {
         markProviderFailed(cand.provider);
+        if (result.statusCode >= 500) markProvider5xx(cand.provider); // 5xx 熔断计数
+        if (result.statusCode === 429) markProvider429(cand.provider); // 429 限流连击提醒
         if (isModelLevelError(result.statusCode, result.body, isValidCompletion(result.body))) {
           markModelFailed(modelName);
         }
@@ -1613,11 +1807,13 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.listen(MY_PORT, HOST, () => {
+server.listen(MY_PORT, currentHost, () => {
+  const mode = currentHost === '0.0.0.0' ? `局域网可访问（${lanIPv4() || '未知IP'}）` : '仅本机';
   console.log(`\n✅ 路由代理已启动（故障转移 + 流式支持 + 管理面板）`);
-  console.log(`   接口地址: http://${HOST}:${MY_PORT}/v1`);
-  console.log(`   管理面板: http://${HOST}:${MY_PORT}/`);
-  console.log(`   API Key: ${maskKey(settings.apiKey)}（settings.json 可改）`);
+  console.log(`   监听: ${currentHost}:${MY_PORT}（${mode}）`);
+  console.log(`   接口地址: ${accessBaseUrl()}/v1`);
+  console.log(`   管理面板: ${accessBaseUrl()}/`);
+  console.log(`   API Key: ${maskKey(settings.apiKey)}（管理面板可改）`);
   console.log(`   配置文件: ${configPath}`);
   console.log(`\n📋 已加载 ${providerList.length} 个 provider:`);
   for (const p of providerList) {
@@ -1626,5 +1822,7 @@ server.listen(MY_PORT, HOST, () => {
   console.log(`\n📦 去重后配置模型 ${allModelsSorted().length} 个，当前可用 ${availableModels().length} 个`);
   scheduleProbe();
   setTimeout(runProbeAll, 3000); // 启动 3 秒后先探活一轮
+  restoreQuotaSuspended(); // 启动时先恢复「昨天限流停用」的站（防服务在 0 点后重启漏恢复）
+  scheduleMidnightReset(); // 安排每晚 0 点恢复限流停用站
   // 稳定性测试改为手动触发（总览页「测试稳定性」按钮），不再自动跑，防忙碌时健康检查超时误判僵尸重启
 });
