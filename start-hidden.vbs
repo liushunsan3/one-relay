@@ -9,6 +9,7 @@ nodeExe = ""
 candidates = Array( _
   here & "\node\node.exe", _
   here & "\nodejs\node.exe", _
+  "C:\Users\" & sh.ExpandEnvironmentStrings("%USERNAME%") & "\nodejs\node.exe", _
   "C:\Program Files\nodejs\node.exe", _
   "C:\Program Files (x86)\nodejs\node.exe" _
 )
