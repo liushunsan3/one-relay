@@ -23,3 +23,5 @@ dist/
 # DSW 鍕挜鐣欐畫鑴氭湰锛堟湰鍦板伐叿锛屼笉鍏ュ簲寮€搴擄級
 s36*.sh
 tunnel_all.sh
+
+sync-github.cjs

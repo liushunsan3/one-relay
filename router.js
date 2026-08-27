@@ -244,6 +244,13 @@ function markProviderSuccess(providerName) {
   }
   provider5xx[providerName] = { streak: 0, until: 0 };
   if (provider429[providerName]) provider429[providerName].streak = 0; // 成功一次即清零 429 连击
+  // 真实业务成功是最强的健康证明：即时纠偏探活快照为「通」，
+  // 防止断网期间的陈旧失败快照长时间把评分压在 ×0.3（最长要等半个探活周期才纠正）
+  const pr = probeState[providerName];
+  if (pr && pr.ok !== true && !pr.busy) {
+    probeState[providerName] = { ...pr, ok: true, err: '', time: Date.now() };
+    computeProviderScore(providerName);
+  }
 }
 
 // ============ 429 限流提醒 + 自动停用/午夜恢复 ============
@@ -513,8 +520,9 @@ function computeProviderScore(name) {
       score += d;
       detail.push(`延迟${Math.round(lat)}ms+${Math.round(d)}`);
     }
-    // ④ 探活不通：总分 ×0.3 封顶（刚挂的站不被历史高分误选）
-    if (probe && !probe.busy && !probe.ok) { score *= 0.3; detail.push('探活挂×0.3'); }
+    // ④ 探活不通：总分 ×0.3 封顶（刚挂的站不被历史高分误选）。
+    //    但结果超过 45 分钟（1.5 个探活周期）视为过期数据不采信——断网期间的陈旧失败不该一直压分
+    if (probe && !probe.busy && !probe.ok && Date.now() - (probe.time || 0) < 45 * 60 * 1000) { score *= 0.3; detail.push('探活挂×0.3'); }
     // ⑤ 5xx 冷却中：探活可能仍绿（GET /models 通），但对话请求全 5xx，直接压到极低分垫底
     if (is5xxCooling(name)) { score = Math.min(score, 1); detail.push('5xx冷却'); }
     providerScores[name] = { score: Math.round(score), detail: detail.join(' '), ms: lat == null ? null : Math.round(lat) };
@@ -709,9 +717,10 @@ function httpGetJson(url, headers, timeoutMs) {
     req.on('error', (e) => resolve({ ok: false, status: 0, ms: Date.now() - started, err: e.message }));
   });
 }
-async function probeOne(name) {
+// 纯探测：发请求更新探活快照，不做踢出判定
+async function probeOnce(name) {
   const p = PROVIDERS[name];
-  if (!p || p.enabled === false) { delete probeState[name]; return; } // 已踢出/停用：不再探测
+  if (!p || p.enabled === false) return null; // 已踢出/停用：不再探测
   probeState[name] = { ...(probeState[name] || {}), busy: true };
   const t0 = Date.now();
   const r = await sniffModels(p.baseUrl, p.key); // 复用路径嗅探，避免 /v1/v1 双拼
@@ -721,12 +730,23 @@ async function probeOne(name) {
     time: Date.now(), busy: false,
   };
   computeProviderScore(name); // 评分随探活实时更新
-  // 自动踢判定：连续 3 次失败 → 当轮立即复验 → 仍失败确认真死才踢
+  return r;
+}
+
+// 单站探测入口（手动触发用）：探测 + 正常连败/踢出判定
+async function probeOne(name) {
+  const r = await probeOnce(name);
+  if (r) await handleProbeResult(name, r, false);
+}
+
+// 探测结果处理：连续失败计数与自动踢；netDown=本机网络故障时不计连败（防断网把好站全误杀）
+async function handleProbeResult(name, r, netDown) {
   if (r.ok) { probeFailStreak[name] = 0; return; }
+  if (netDown) { console.log(`  📡 本机网络疑似故障，${name} 本轮不计探活连败`); return; }
   probeFailStreak[name] = (probeFailStreak[name] || 0) + 1;
   if (probeFailStreak[name] >= 3 && settings.autoKick !== false) {
     try {
-      const again = await sniffModels(p.baseUrl, p.key); // 复验
+      const again = await sniffModels(PROVIDERS[name].baseUrl, PROVIDERS[name].key); // 复验
       if (!again.ok) await kickProvider(name);
       else probeFailStreak[name] = 0; // 复验活了：重置计数
     } catch (e) { console.log(`踢出检查出错(${name}): ${e.message}`); }
@@ -759,8 +779,20 @@ async function kickProvider(name) {
     console.log(`  🥊 已自动踢出废站: ${name}${lostNote}`);
   } catch (e) { console.log(`踢出 ${name} 出错: ${e.message}`); }
 }
-function runProbeAll() {
-  for (const n of Object.keys(PROVIDERS)) probeOne(n);
+// 全量探测：并发跑完 → 若 ≥80% 站同时失败（≥3站）判定为本机网络故障，本轮全员不计连败、不踢
+async function runProbeAll() {
+  const names = Object.keys(PROVIDERS);
+  const results = await Promise.all(names.map(async n => ({ n, r: await probeOnce(n) })));
+  const valid = results.filter(x => x.r);
+  const fails = valid.filter(x => !x.r.ok).length;
+  const netDown = valid.length >= 3 && fails / valid.length >= 0.8;
+  if (netDown) {
+    const msg = `📡 本机网络疑似故障（${valid.length} 个站中 ${fails} 个探活失败），本轮全部不计连败、不自动踢`;
+    console.log(`\n${msg}\n`);
+    sendNotify(msg);
+    addChangelog('自动', msg);
+  }
+  for (const { n, r } of results) if (r) await handleProbeResult(n, r, netDown);
 }
 
 // ============ 模型列表探测（多路径嗅探，供助手与表单用） ============

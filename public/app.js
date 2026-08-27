@@ -302,10 +302,11 @@ async function renderProviders() {
         : '';
       const insecure = /^http:\/\//.test(p.baseUrl) ? ' ⚠️<span class="hint">明文</span>' : '';
       const pi = prio.indexOf(p.name);
-      const sc = p.score;
-      const scoreCell = sc
+      // 评分来自 /admin/api/status（providers 接口不带 score）；status 每 5s 轮询已有缓存
+      const sc = (status && status.providers.find(x => x.name === p.name) || {}).score;
+      const scoreCell = (sc && typeof sc.score === 'number' && sc.score >= 0)
         ? `<span class="progress" title="${escapeHtml(sc.detail || '')}"><i class="${sc.score >= 70 ? 'p-hi' : sc.score >= 40 ? 'p-mid' : 'p-lo'}" style="--p:${Math.max(0, Math.min(100, sc.score))}%"></i></span> ${sc.score}`
-        : '—';
+        : enabled ? '计算中…' : '—';
       return `<tr>
         <td><b>${escapeHtml(p.name)}</b>${statusTag}</td>
         <td class="wrap mono">${escapeHtml(p.baseUrl)}${insecure}</td>
