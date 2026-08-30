@@ -291,53 +291,58 @@ async function renderProviders() {
     const [pv, st] = await Promise.all([api('/admin/api/providers'), api('/admin/api/settings')]);
     providersCache = pv;
     settingsCache = st;
-    const prio = st.priority || [];
-    const status = lastStatus;
-    const rows = pv.list.map(p => {
-      const enabled = p.enabled !== false;
-      const probe = status && status.providers.find(x => x.name === p.name);
-      const pc = p.enabled === false ? '—' : (probe && probe.probe ? (probe.probe.ok ? '✅' : '❌') : '·');
-      const statusTag = p.enabled === false
-        ? (p.disabledBy === 'auto' ? ' <span class="tag tag-bad">已踢出</span>' : p.disabledBy === 'quota' ? ' <span class="tag tag-warn">限流停用</span>' : ' <span class="tag tag-muted">已停用</span>')
-        : '';
-      const insecure = /^http:\/\//.test(p.baseUrl) ? ' ⚠️<span class="hint">明文</span>' : '';
-      const pi = prio.indexOf(p.name);
-      // 评分来自 /admin/api/status（providers 接口不带 score）；status 每 5s 轮询已有缓存
-      const sc = (status && status.providers.find(x => x.name === p.name) || {}).score;
-      const scoreCell = (sc && typeof sc.score === 'number' && sc.score >= 0)
-        ? `<span class="progress" title="${escapeHtml(sc.detail || '')}"><i class="${sc.score >= 70 ? 'p-hi' : sc.score >= 40 ? 'p-mid' : 'p-lo'}" style="--p:${Math.max(0, Math.min(100, sc.score))}%"></i></span> ${sc.score}`
-        : enabled ? '计算中…' : '—';
-      return `<tr>
-        <td><b>${escapeHtml(p.name)}</b>${statusTag}</td>
-        <td class="wrap mono">${escapeHtml(p.baseUrl)}${insecure}</td>
-        <td>${p.models.length}</td>
-        <td title="${sc ? escapeHtml(sc.detail || '') : ''}">${scoreCell}</td>
-        <td><label class="chk"><input type="checkbox" data-toggle="${escapeHtml(p.name)}" ${enabled ? 'checked' : ''}></label></td>
-        <td>${pc}</td>
-        <td>${pi >= 0 ? pi + 1 : '-'}</td>
-        <td>
-          <button class="btn sm" data-up="${escapeHtml(p.name)}" title="优先级上移">↑</button>
-          <button class="btn sm" data-down="${escapeHtml(p.name)}" title="优先级下移">↓</button>
-        </td>
-        <td>
-          <button class="btn sm" data-edit="${escapeHtml(p.name)}">编辑</button>
-          <button class="btn sm" data-test="${escapeHtml(p.name)}">测试</button>
-          <button class="btn sm danger" data-del="${escapeHtml(p.name)}">删除</button>
-        </td>
-      </tr>`;
-    }).join('');
-    $('#providerTable').innerHTML = `<thead><tr><th>站点</th><th>地址</th><th>模型数</th><th>评分</th><th>启用</th><th>探活</th><th>优先级</th><th>调整</th><th>操作</th></tr></thead><tbody>${rows}</tbody>`;
-    // 智能路由开关状态同步
-    const smartOn = st.smartRouting !== false;
-    const sb = $('#smartRoutingBtn');
-    sb.textContent = smartOn ? '⚡ 智能路由：开' : '⚡ 智能路由：关';
-    sb.classList.toggle('primary', smartOn);
-    $('#routingHint').textContent = smartOn
-      ? '智能路由开启：自动选评分最高的站（优先级仅作同分参考）'
-      : '固定优先级模式：越靠前越优先（点击 ↑↓ 调整）';
+    renderProvidersTable();
   } catch (e) {
     $('#providerTable').innerHTML = `<tbody><tr><td>加载失败：${escapeHtml(e.message)}</td></tr></tbody>`;
   }
+}
+// 纯渲染（零网络）：用缓存 providersCache/settingsCache/lastStatus 直接重绘，供乐观更新即时调用
+function renderProvidersTable() {
+  const list = (providersCache && providersCache.list) || [];
+  const st = settingsCache || {};
+  const prio = st.priority || [];
+  const status = lastStatus;
+  const rows = list.map(p => {
+    const enabled = p.enabled !== false;
+    const probe = status && status.providers.find(x => x.name === p.name);
+    const pc = p.enabled === false ? '—' : (probe && probe.probe ? (probe.probe.ok ? '✅' : '❌') : '·');
+    const statusTag = p.enabled === false
+      ? (p.disabledBy === 'auto' ? ' <span class="tag tag-bad">已踢出</span>' : p.disabledBy === 'quota' ? ' <span class="tag tag-warn">限流停用</span>' : ' <span class="tag tag-muted">已停用</span>')
+      : '';
+    const insecure = /^http:\/\//.test(p.baseUrl) ? ' ⚠️<span class="hint">明文</span>' : '';
+    const pi = prio.indexOf(p.name);
+    // 评分来自 /admin/api/status（providers 接口不带 score）
+    const sc = (status && status.providers.find(x => x.name === p.name) || {}).score;
+    const scoreCell = (sc && typeof sc.score === 'number' && sc.score >= 0)
+      ? `<span class="progress" title="${escapeHtml(sc.detail || '')}"><i class="${sc.score >= 70 ? 'p-hi' : sc.score >= 40 ? 'p-mid' : 'p-lo'}" style="--p:${Math.max(0, Math.min(100, sc.score))}%"></i></span> ${sc.score}`
+      : enabled ? '计算中…' : '—';
+    return `<tr>
+      <td><b>${escapeHtml(p.name)}</b>${statusTag}</td>
+      <td class="wrap mono">${escapeHtml(p.baseUrl)}${insecure}</td>
+      <td>${p.models.length}</td>
+      <td title="${sc ? escapeHtml(sc.detail || '') : ''}">${scoreCell}</td>
+      <td><label class="chk"><input type="checkbox" data-toggle="${escapeHtml(p.name)}" ${enabled ? 'checked' : ''}></label></td>
+      <td>${pc}</td>
+      <td>${pi >= 0 ? pi + 1 : '-'}</td>
+      <td>
+        <button class="btn sm" data-up="${escapeHtml(p.name)}" title="优先级上移">↑</button>
+        <button class="btn sm" data-down="${escapeHtml(p.name)}" title="优先级下移">↓</button>
+      </td>
+      <td>
+        <button class="btn sm" data-edit="${escapeHtml(p.name)}">编辑</button>
+        <button class="btn sm" data-test="${escapeHtml(p.name)}">测试</button>
+        <button class="btn sm danger" data-del="${escapeHtml(p.name)}">删除</button>
+      </td>
+    </tr>`;
+  }).join('');
+  $('#providerTable').innerHTML = `<thead><tr><th>站点</th><th>地址</th><th>模型数</th><th>评分</th><th>启用</th><th>探活</th><th>优先级</th><th>调整</th><th>操作</th></tr></thead><tbody>${rows}</tbody>`;
+  const smartOn = st.smartRouting !== false;
+  const sb = $('#smartRoutingBtn');
+  sb.textContent = smartOn ? '⚡ 智能路由：开' : '⚡ 智能路由：关';
+  sb.classList.toggle('primary', smartOn);
+  $('#routingHint').textContent = smartOn
+    ? '智能路由开启：自动选评分最高的站（优先级仅作同分参考）'
+    : '固定优先级模式：越靠前越优先（点击 ↑↓ 调整）';
 }
 
 $('#tab-providers').addEventListener('change', async (e) => {
@@ -368,10 +373,11 @@ $('#tab-providers').addEventListener('click', async (e) => {
     const j = btn.dataset.up ? Math.max(0, i - 1) : Math.min(prio.length - 1, i + 1);
     if (i >= 0) prio.splice(i, 1);
     prio.splice(Math.max(0, j - (i < 0 ? 1 : 0)), 0, name);
-    try {
-      await api('/admin/api/settings', { method: 'PUT', body: { priority: prio } });
-      renderProviders();
-    } catch (err) { toast(err.message, 'err'); }
+    // 乐观更新：本地立即换序重绘（零网络，点一下毫秒级反馈），后台异步提交
+    settingsCache = { ...settingsCache, priority: prio };
+    renderProvidersTable();
+    api('/admin/api/settings', { method: 'PUT', body: { priority: prio } })
+      .catch(err => { toast(err.message, 'err'); renderProviders(); });
     return;
   }
   if (btn.dataset.test) {
