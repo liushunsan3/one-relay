@@ -88,6 +88,7 @@ fs.watchFile(settingsPath, { interval: 1000 }, () => {
       settings = { ...settings, ...fresh };
       scheduleProbe();
       applyBindLan(); // bindLan 开关变化 → 运行时切换监听地址
+      broadcast('status'); // bindLan/apiKey/优先级等设置变化 → 面板实时刷新
       console.log(`\n⚙️ settings 已热加载: apiKey=*** 优先级=${(settings.priority || []).length} 项\n`);
     } catch (e) {
       console.log(`\n❌ settings 热加载失败（保留旧配置）: ${e.message}\n`);
@@ -186,6 +187,8 @@ fs.watchFile(configPath, { interval: 1000 }, () => {
       for (const n of Object.keys(probeState)) if (!names.has(n)) delete probeState[n];
       for (const n of Object.keys(PROVIDERS)) computeProviderScore(n); // 配置变化后评分全量重算
       const allModels = [...new Set(Object.values(PROVIDERS).flatMap(p => [...p.models, ...Object.keys(p.aliases)]))];
+      broadcast('providers'); broadcast('status'); // 站点增删/启停/kick 等配置变更 → 面板实时刷新
+      broadcast('memory'); // changelog 可能新增
       console.log(`\n🔄 配置已热加载: ${fresh.length} 个 provider, ${allModels.length} 个模型\n`);
     } catch (e) {
       console.log(`\n❌ 热加载失败（保留旧配置）: ${e.message}\n`);
@@ -641,6 +644,7 @@ function recordAttempt(model, provider, ms, code, ok, stream, usage) {
   if (reqHistory.length > 200) reqHistory.splice(0, reqHistory.length - 200);
   computeProviderScore(provider); // 评分随请求实时更新
   scheduleStatsSave();
+  broadcast('status'); broadcast('providers'); broadcast('stats'); // 面板实时刷新：评分/请求历史/用量统计
 }
 function recordClientResult(ok) {
   const b = todayBucket();
@@ -730,6 +734,7 @@ async function probeOnce(name) {
     time: Date.now(), busy: false,
   };
   computeProviderScore(name); // 评分随探活实时更新
+  broadcast('providers'); broadcast('status'); // 面板实时刷新：探活/评分
   return r;
 }
 
@@ -1147,6 +1152,18 @@ async function handleConsolidate(req, res, body) {
 }
 
 // ============ 管理面板基础设施（仅本机 + 防 DNS rebinding） ============
+// SSE 实时推送：面板事件发生时主动推给浏览器，替代固定间隔轮询（轮询仍保留作兜底）
+const sseClients = new Set();   // 活跃的 SSE 响应流
+const sseTimers = {};           // type -> timeout（事件合并 debounce）
+function broadcast(type, data) {
+  if (sseTimers[type]) return;  // 250ms 内同类事件合并，防请求高峰期刷屏
+  sseTimers[type] = setTimeout(() => {
+    sseTimers[type] = null;
+    for (const res of sseClients) {
+      try { res.write(`event: ${type}\ndata: ${JSON.stringify(data || {})}\n\n`); } catch (e) {}
+    }
+  }, 250);
+}
 function sendJSON(res, code, obj) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(obj));
@@ -1339,6 +1356,19 @@ async function handleApply(req, res, body) {
 async function handleAdmin(req, res, reqUrl) {
   const p = reqUrl.pathname;
   const m = req.method;
+
+  // SSE 事件流：面板 EventSource 挂在这里接收实时事件（status/providers/stats/memory）
+  if (m === 'GET' && p === '/admin/api/events') {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    });
+    res.write('retry: 3000\n\n');
+    sseClients.add(res);
+    req.on('close', () => sseClients.delete(res));
+    return;
+  }
 
   if (m === 'GET' && p === '/admin/api/status') {
     const providers = Object.entries(PROVIDERS).map(([name, cfg]) => ({

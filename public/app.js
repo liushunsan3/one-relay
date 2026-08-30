@@ -1552,12 +1552,26 @@ function renderLogBox() {
 }
 
 /* ============ 启动 ============ */
+/* SSE 实时推送：事件发生时后端主动推来，面板即时刷新（主通道；轮询降为兜底） */
+function connectEvents() {
+  try {
+    const es = new EventSource('/admin/api/events');
+    es.addEventListener('status', () => refreshStatus());
+    es.addEventListener('providers', async () => {
+      if (activeTab === 'providers') { await refreshStatus(); renderProviders(); }
+    });
+    es.addEventListener('stats', () => { if (activeTab === 'stats') refreshStats(); });
+    es.addEventListener('memory', () => { if (activeTab === 'assistant') refreshMemory(); });
+    // EventSource 断线自动重连(retry:3000)，无需手动处理
+  } catch (e) {}
+}
 renderChat();
 refreshStatus().then(() => { checkAssistantSetup(); });
-setInterval(async () => {
+connectEvents();
+setInterval(async () => {           // 兜底轮询（SSE 断连时不黑屏，间隔放宽）
   await refreshStatus();
-  if (activeTab === 'providers') renderProviders(); // Provider 页此前无自动刷新：评分/探活/停用标记变更不切页看不到
-}, 5000);
+  if (activeTab === 'providers') renderProviders();
+}, 15000);
 setInterval(pollLogs, 2000);
 setInterval(() => { if (activeTab === 'stats') refreshStats(); }, 10000);
 
