@@ -398,7 +398,16 @@ $('#addProviderBtn').onclick = () => openProviderModal(null);
 $('#probeAllBtn').onclick = async () => {
   toast('已开始全部探活…');
   await api('/admin/api/probe', { method: 'POST', body: { name: 'all' } }).catch(() => {});
-  setTimeout(() => { renderProviders(); refreshStatus(); }, 6000);
+  // 轮询直到所有站探完（busy 消失）或超时，替代硬等 6 秒（探活异步，常常 6 秒没跑完显得像没反应）
+  for (let i = 0; i < 15; i++) {
+    await sleep(1000);
+    try {
+      const s = await api('/admin/api/status');
+      if (!s.providers.some(p => p.probe && p.probe.busy)) break;
+    } catch (e) {}
+  }
+  renderProviders();
+  refreshStatus();
 };
 
 // 智能路由开关（切换后 settings 热加载约 2 秒生效）
@@ -1545,7 +1554,10 @@ function renderLogBox() {
 /* ============ 启动 ============ */
 renderChat();
 refreshStatus().then(() => { checkAssistantSetup(); });
-setInterval(refreshStatus, 5000);
+setInterval(async () => {
+  await refreshStatus();
+  if (activeTab === 'providers') renderProviders(); // Provider 页此前无自动刷新：评分/探活/停用标记变更不切页看不到
+}, 5000);
 setInterval(pollLogs, 2000);
 setInterval(() => { if (activeTab === 'stats') refreshStats(); }, 10000);
 

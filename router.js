@@ -14,7 +14,7 @@ const os = require('os');
 const APP_DIR = __dirname;
 const TAG = process.env.RP_PORT && process.env.RP_PORT !== '3099' ? process.env.RP_PORT : 'main';
 const MY_PORT = parseInt(process.env.RP_PORT || '3099', 10);
-const UPSTREAM_TIMEOUT = 30000;
+const UPSTREAM_TIMEOUT = 600000;
 const startedAt = Date.now();
 
 // 全局未捕获异常处理：防止任何遗漏的 Promise rejection 导致进程退出（Node 15+ 默认行为）
