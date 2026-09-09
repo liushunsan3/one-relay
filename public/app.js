@@ -616,7 +616,10 @@ function renderChat() {
     }
     const body = m.role === 'assistant' ? renderMarkdown(m.content) : escapeHtml(m.content);
     const cursor = (streaming && idx === chatStore.length - 1 && m.role === 'assistant') ? '<span class="cursor-blink">▍</span>' : '';
-    return `<div class="msg ${m.role}"><div class="who">${m.role === 'user' ? '我' : '助手'}</div><div class="body">${body}${cursor}</div></div>`;
+    const reasonBlock = (m.role === 'assistant' && m.reasoning)
+      ? `<details class="tool-result reason"><summary>💭 思考过程（${m.reasoning.length} 字）</summary><pre>${escapeHtml(m.reasoning)}</pre></details>`
+      : '';
+    return `<div class="msg ${m.role}"><div class="who">${m.role === 'user' ? '我' : '助手'}</div>${reasonBlock}<div class="body">${body}${cursor}</div></div>`;
   }).join('');
   box.scrollTop = box.scrollHeight;
 }
@@ -913,7 +916,7 @@ function maybeAutoConsolidate() {
 // 中断时返回值末尾带 [[INTERRUPTED]] 标记（调用方据此跳过块解析）
 let assistantAbort = null;
 async function streamAssistant(history) {
-  const aiMsg = { role: 'assistant', content: '' };
+  const aiMsg = { role: 'assistant', content: '', reasoning: '' };
   chatStore.push(aiMsg);
   renderChat();
   assistantAbort = new AbortController();
@@ -946,7 +949,11 @@ async function streamAssistant(history) {
           try {
             const j = JSON.parse(data);
             const delta = j.choices && j.choices[0] && j.choices[0].delta;
-            if (delta && delta.content) aiMsg.content += delta.content;
+            if (delta) {
+              if (delta.reasoning_content) aiMsg.reasoning += delta.reasoning_content; // 思考过程单独收，不混进正文
+              else if (delta.reasoning) aiMsg.reasoning += delta.reasoning;              // 兼容 reasoning 字段(R1类)
+              if (delta.content) aiMsg.content += delta.content;                        // 正文（工具块/提案靠它）
+            }
           } catch (e) {}
         }
         scheduleRender();

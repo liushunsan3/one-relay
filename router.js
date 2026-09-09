@@ -945,9 +945,21 @@ function configSummary() {
   const lines = [];
   for (const [name, p] of Object.entries(PROVIDERS)) {
     const alias = Object.keys(p.aliases).length ? ' 别名:' + JSON.stringify(p.aliases) : '';
-    lines.push(`- ${name} | ${p.baseUrl} | 模型: ${p.models.join(', ')}${alias}${p.enabled === false ? ' | [已禁用]' : ''} | key: 已配置（保密）`);
+    let state = '';
+    if (p.enabled === false) {
+      const d = (providerList.find(x => x.name === name) || {}).disabledBy;
+      state = d === 'auto' ? ' [已自动踢出:探活连败]' : d === 'quota' ? ' [限流停用:0点恢复]' : ' [已手动停用]';
+    } else {
+      const pr = probeState[name];
+      state = !pr ? '' : pr.busy ? ' [探测中]' : pr.ok ? ` [探活通 ${pr.ms}ms]` : ` [探活不通: ${pr.err}]`;
+    }
+    const sc = providerScores[name];
+    const score = sc && sc.score >= 0 ? ` 评分${sc.score}` : '';
+    lines.push(`- ${name} | ${p.baseUrl} | 模型: ${p.models.join(', ')}${alias}${state}${score} | key: 已配置（保密）`);
   }
   lines.push(`优先级（快→慢）: ${(settings.priority || []).join(' → ') || '（默认顺序）'}`);
+  const enabledCount = Object.keys(PROVIDERS).filter(n => PROVIDERS[n].enabled !== false).length;
+  lines.push(`阵容总览: ${PROVIDERS ? Object.keys(PROVIDERS).length : 0} 个站（${enabledCount} 个启用），当前可用模型 ${availableModels().length} 个`);
   return lines.join('\n');
 }
 function memorySummary() {
@@ -984,11 +996,12 @@ function handleAssistant(req, res, body) {
     .slice(-20);
 
   const sys = `${ASSISTANT_SYSTEM}\n\n## 当前配置实时摘要（以此为准）\n${configSummary()}\n\n## 配置记忆\n${memorySummary()}`;
-  const messages = [{ role: 'system', content: sys }, ...history];
+  // 剥离前端 assistant 消息上携带的 reasoning 字段，只回传 role+content（防上游报 UNKNOWN_FIELD）
+  const messages = [{ role: 'system', content: sys }, ...history.map(m => ({ role: m.role, content: m.content }))];
 
   const base = normalizeBase(a.baseUrl).replace(/\/v1$/, '');
   const target = new URL(base + '/v1/chat/completions');
-  const payload = JSON.stringify({ model: a.model, messages, stream: true });
+  const payload = JSON.stringify({ model: a.model, messages, stream: true, max_tokens: 8192 });
   const transport = target.protocol === 'https:' ? https : http;
   const upReq = transport.request({
     hostname: target.hostname,
@@ -1044,7 +1057,7 @@ function callAssistantNonStream(messages) {
     if (!a.baseUrl || !a.key || !a.model) { reject(new Error('助手 API 未配置')); return; }
     const base = normalizeBase(a.baseUrl).replace(/\/v1$/, '');
     const target = new URL(base + '/v1/chat/completions');
-    const payload = JSON.stringify({ model: a.model, messages, stream: false });
+    const payload = JSON.stringify({ model: a.model, messages, stream: false, max_tokens: 8192 });
     const transport = target.protocol === 'https:' ? https : http;
     const req = transport.request({
       hostname: target.hostname,
