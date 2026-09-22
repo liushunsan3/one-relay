@@ -4,6 +4,13 @@
 
 ## 2026-09-22
 
+### 商汤限流真相：两层限制（RPS + RPM/TPM）
+- **第二层限制被发现**：除 RPS(4/秒) 外，`deepseek-v4-pro` 撞的是 **RPM/TPM（每分钟配额）**——响应体 `{"message":"inference exceeds tpm/rpm limit","type":"rate_limit_error","code":"429005"}`。这解释了「间隔 4~10 秒也 429」（分钟级配额而非秒级）且 body 不含 rps 被判成"额度用尽"。
+- **429 分类扩展**：`tpm|rpm|per minute` 也归入速率类（**不停用**，避免误伤），但冷却时长按类型区分——RPS → 2 秒；RPM/TPM → 60 秒。
+- **日志增强**：429 时记录响应体摘要（区分 rps/rpm/额度全靠它，此前只记判定结果，出问题只能靠猜）。
+- **模型清理**：商汤 9 个模型逐个实测 → `sensenova-u1-fast`(404)、`sensenova-u1.5-lite`(404)、`deepseek-v4.1-flash`(403) 客观不可用已从配置移除；保留 6 个（deepseek-v4-flash / glm-5.2 / sensenova-6.8-flash-lite / deepseek-v4-pro / kimi-k3 / deepseek-flash）。
+- ⚠️ **`deepseek-v4-pro` 配额已耗尽**：实测等待 90 秒仍 429，说明不是每分钟恢复而是更长窗口（小时/日级）用尽——非代码问题，需等商汤配额恢复或改用其他模型。
+
 ### 商汤 RPS 限速适配（实测驱动）
 - **实测结论**：商汤 `token.sensenova.cn` 的限流是 **RPS（每秒请求数）**，阈值约 **4/秒/账号**（响应体 `{"error":{"message":"rps exhausted"}}`）。实测并发 4 全过、5 临界、6 几乎全 429；串行 120 次/分钟反而不触发——证明不是 RPM/TPM。
 - **429 分类型处理**（修复「频繁请求被踢」）：

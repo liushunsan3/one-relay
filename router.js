@@ -267,15 +267,17 @@ const provider429 = {};                    // name -> { streak, lastNotify, noti
 const R429_STREAK_THRESHOLD = 5;           // 连续 5 次 429 触发提醒
 const R429_NOTIFY_COOLDOWN = 10 * 60 * 1000; // 同一站 10 分钟内最多提醒一次（防刷屏）
 const R429_SUSPEND_AFTER = 2;              // 当天累计提醒达 2 次 → 停用（仅额度类）
-const R429_COOLDOWN_MS = 2000;             // 速率类 429 的冷却时长（RPS 是秒级窗口，2 秒足够满血）
+const R429_COOLDOWN_MS = 2000;             // 速率类(RPS) 429 冷却：秒级窗口，2 秒足够满血
+const R429_COOLDOWN_RPM_MS = 60000;        // 分钟级配额(RPM/TPM) 429 冷却：要等下一分钟才恢复
 const provider429Cool = {};                // name -> 冷却截止时间戳
 function is429Cooling(name) { return !!(provider429Cool[name] && Date.now() < provider429Cool[name]); }
 function markProvider429(providerName, body) {
-  // 速率类判定：上游明确说是 rps/rate limit；额度类则是 quota/余额等
+  // 分类：① RPS(每秒) ② RPM/TPM(每分钟配额) ③ 额度类(quota/余额，长时间)
   const text = String(body || '').toLowerCase();
-  const isRateLimit = /rps|rate.?limit|too many request/.test(text);
-  // ① 无论哪类，先给一个秒级冷却：避免同一秒内继续往这个站撞（这是治「被踢」的关键）
-  provider429Cool[providerName] = Date.now() + R429_COOLDOWN_MS;
+  const isRpm = /tpm|rpm|per.?minute|每分钟/.test(text);
+  const isRateLimit = /rps|qps|rate.?limit|too many request|concurren|throttl|请求过[于快]|频繁|限速|tpm|rpm/.test(text);
+  // ① 冷却时长按类型定：RPS 2 秒；RPM/TPM 等一分钟；额度类也给短冷却（停用另走流程）
+  provider429Cool[providerName] = Date.now() + (isRpm ? R429_COOLDOWN_RPM_MS : R429_COOLDOWN_MS);
   computeProviderScore(providerName);
 
   const s = provider429[providerName] || (provider429[providerName] = { streak: 0, lastNotify: 0, notifyCount: 0 });
@@ -283,12 +285,14 @@ function markProvider429(providerName, body) {
   if (s.streak >= R429_STREAK_THRESHOLD && Date.now() - s.lastNotify > R429_NOTIFY_COOLDOWN) {
     s.lastNotify = Date.now();
     s.notifyCount++;
-    const kind = isRateLimit ? '请求速率超限(rps)' : '疑似额度用尽';
+    const kind = isRpm ? '分钟配额超限(rpm/tpm)' : isRateLimit ? '请求速率超限(rps)' : '疑似额度用尽';
     const msg = `站点 ${providerName} 连续限流（429：${kind}），提醒 ${s.notifyCount}/${R429_SUSPEND_AFTER} 次`;
     console.log(`  ⏳ ${msg}`);
+    // 记录响应体摘要：区分 rps/rpm/额度全靠它，不记下来下次只能靠猜
+    if (body) console.log(`     429 body: ${String(body).replace(/\s+/g, ' ').slice(0, 160)}`);
     sendNotify(msg);
     addChangelog('自动', msg);
-    // ② 只有额度类才停用；速率类靠秒级冷却即可，停用它纯属误伤
+    // ② 只有额度类才停用；速率类（含 rpm/tpm）靠冷却即可，停用它纯属误伤
     if (!isRateLimit && s.notifyCount >= R429_SUSPEND_AFTER) suspendProviderForQuota(providerName);
   }
 }
