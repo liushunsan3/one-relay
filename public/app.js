@@ -310,9 +310,16 @@ function renderProvidersTable() {
       ? (p.disabledBy === 'auto' ? ' <span class="tag tag-bad">已踢出</span>' : p.disabledBy === 'quota' ? ' <span class="tag tag-warn">限流停用</span>' : ' <span class="tag tag-muted">已停用</span>')
       : '';
     const insecure = /^http:\/\//.test(p.baseUrl) ? ' ⚠️<span class="hint">明文</span>' : '';
+    const stProv = (status && status.providers.find(x => x.name === p.name)) || {};
+    // RPS 上限 + 当前秒占用（防撞上游每秒请求限速；未配置=不限）
+    const rpsLimit = p.rps || 0;
+    const rpsNow = stProv.rpsNow || 0;
+    const rpsCell = rpsLimit
+      ? `<span title="每秒上限 ${rpsLimit}，当前秒已发 ${rpsNow}；超出自动让位给别的站">${rpsNow}/${rpsLimit}${stProv.cooling429 ? ' ⏳' : ''}</span>`
+      : '<span class="hint">不限</span>';
     const pi = prio.indexOf(p.name);
     // 评分来自 /admin/api/status（providers 接口不带 score）
-    const sc = (status && status.providers.find(x => x.name === p.name) || {}).score;
+    const sc = stProv.score;
     const scoreCell = (sc && typeof sc.score === 'number' && sc.score >= 0)
       ? `<span class="progress" title="${escapeHtml(sc.detail || '')}"><i class="${sc.score >= 70 ? 'p-hi' : sc.score >= 40 ? 'p-mid' : 'p-lo'}" style="--p:${Math.max(0, Math.min(100, sc.score))}%"></i></span> ${sc.score}`
       : enabled ? '计算中…' : '—';
@@ -320,6 +327,7 @@ function renderProvidersTable() {
       <td><b>${escapeHtml(p.name)}</b>${statusTag}</td>
       <td class="wrap mono">${escapeHtml(p.baseUrl)}${insecure}</td>
       <td>${p.models.length}</td>
+      <td>${rpsCell}</td>
       <td title="${sc ? escapeHtml(sc.detail || '') : ''}">${scoreCell}</td>
       <td><label class="chk"><input type="checkbox" data-toggle="${escapeHtml(p.name)}" ${enabled ? 'checked' : ''}></label></td>
       <td>${pc}</td>
@@ -335,7 +343,7 @@ function renderProvidersTable() {
       </td>
     </tr>`;
   }).join('');
-  $('#providerTable').innerHTML = `<thead><tr><th>站点</th><th>地址</th><th>模型数</th><th>评分</th><th>启用</th><th>探活</th><th>优先级</th><th>调整</th><th>操作</th></tr></thead><tbody>${rows}</tbody>`;
+  $('#providerTable').innerHTML = `<thead><tr><th>站点</th><th>地址</th><th>模型数</th><th>RPS上限</th><th>评分</th><th>启用</th><th>探活</th><th>优先级</th><th>调整</th><th>操作</th></tr></thead><tbody>${rows}</tbody>`;
   const smartOn = st.smartRouting !== false;
   const sb = $('#smartRoutingBtn');
   sb.textContent = smartOn ? '⚡ 智能路由：开' : '⚡ 智能路由：关';
@@ -462,6 +470,10 @@ function openProviderModal(name) {
         <div id="fAliasRows">${aliases.map(([k, v]) => aliasRowHtml(k, v)).join('') || '<span class="hint">无</span>'}</div>
         <button id="fAddAlias" class="btn sm" type="button">＋ 加一行</button>
       </label>
+      <label>RPS 上限（每秒请求数，留空=不限）
+        <input id="fRps" type="number" min="0" step="1" value="${p && p.rps ? p.rps : ''}" placeholder="如 4（商汤实测约 4/秒/账号）">
+        <span class="hint">该站有每秒请求限速时填上，代理会把超出部分自动让位给别的站，避免撞 429 被限流</span>
+      </label>
       <label class="chk"><input type="checkbox" id="fEnabled" ${!p || p.enabled !== false ? 'checked' : ''}> 启用（停用后路由不再走此站，配置保留）</label>
     </div>
     <div class="m-actions">
@@ -540,11 +552,14 @@ function openProviderModal(name) {
       aliases,
       enabled: $('#fEnabled').checked,
     };
+    const rpsVal = parseInt($('#fRps').value, 10);
+    if (rpsVal > 0) item.rps = rpsVal; else delete item.rps; // 留空/0 = 不限速（删掉字段）
     if (!item.name || !item.baseUrl || !item.models.length) { toast('站名、地址、模型列表不能为空', 'err'); btn.disabled = false; return; }
     const idx = list.findIndex(x => x.name === item.name);
     if (p && idx >= 0) {
       const merged = { ...list[idx], ...item };
       if (!item.key) merged.key = list[idx].key;
+      if (!item.rps) delete merged.rps;   // 清空 RPS = 取消限速（spread 会保留旧值，需显式删）
       list[idx] = merged;
     } else {
       if (idx >= 0) { toast(`已存在同名站「${item.name}」，请换名字或用编辑`, 'err'); btn.disabled = false; return; }

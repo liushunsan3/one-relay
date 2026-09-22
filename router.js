@@ -311,6 +311,13 @@ function markSent(name) {
   if (!p || !p.rps) return;
   (rpsWindow[name] || (rpsWindow[name] = [])).push(Date.now());
 }
+// 供面板显示「当前秒已用/上限」
+function rpsNowCount(name) {
+  const arr = rpsWindow[name];
+  if (!arr || !arr.length) return 0;
+  const now = Date.now();
+  return arr.filter(t => now - t <= 1000).length;
+}
 
 // 停用限流站：enabled=false + disabledBy:'quota'（与 auto踢/手动停用区分），记录停用日期供午夜恢复判断
 async function suspendProviderForQuota(name) {
@@ -1429,6 +1436,9 @@ async function handleAdmin(req, res, reqUrl) {
     const providers = Object.entries(PROVIDERS).map(([name, cfg]) => ({
       name, baseUrl: cfg.baseUrl, keyMasked: maskKey(cfg.key), models: cfg.models,
       aliases: cfg.aliases, enabled: cfg.enabled !== false,
+      rps: cfg.rps || 0,                    // 每秒请求上限（0=不限）
+      rpsNow: rpsNowCount(name),            // 当前秒已用
+      cooling429: is429Cooling(name),       // 是否在 429 秒级冷却中
       disabledBy: (providerList.find(x => x.name === name) || {}).disabledBy || null,
       score: providerScores[name] || null,
       failures: providerHealth[name] ? providerHealth[name].failures : 0,
