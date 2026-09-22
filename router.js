@@ -52,7 +52,10 @@ const PROVIDERS = {};
 function loadProviders(list) {
   const map = {};
   for (const p of list) {
-    map[p.name] = { baseUrl: p.baseUrl, key: p.key, models: p.models, aliases: p.aliases || {}, enabled: p.enabled !== false };
+    map[p.name] = {
+      baseUrl: p.baseUrl, key: p.key, models: p.models, aliases: p.aliases || {}, enabled: p.enabled !== false,
+      rps: Number(p.rps) > 0 ? Number(p.rps) : 0, // 该站每秒请求上限（0=不限），用于避免撞上游 RPS 限速
+    };
   }
   return map;
 }
@@ -256,26 +259,57 @@ function markProviderSuccess(providerName) {
   }
 }
 
-// ============ 429 限流提醒 + 自动停用/午夜恢复 ============
-// 提醒：连续 5 次 429 弹一次通知（10 分钟冷却防刷屏）。
-// 停用：当天累计提醒 2 次 → 自动停用该站（额度已用尽，不再白白重试）。
-// 恢复：每晚 0 点自动恢复被限流停用的站，并重置当天提醒计数。
+// ============ 429 限流处理（分两类）+ 自动停用/午夜恢复 ============
+// ① 速率类（rps exhausted / rate limit）：秒级窗口，下一秒就恢复 → 只做短冷却，绝不停用
+// ② 额度类（quota/余额/欠费）：长时间才恢复 → 保留「累计提醒 2 次 → 停用 → 每晚 0 点恢复」
+// 提醒：连续 5 次 429 弹一次通知（10 分钟冷却防刷屏）
 const provider429 = {};                    // name -> { streak, lastNotify, notifyCount }
 const R429_STREAK_THRESHOLD = 5;           // 连续 5 次 429 触发提醒
 const R429_NOTIFY_COOLDOWN = 10 * 60 * 1000; // 同一站 10 分钟内最多提醒一次（防刷屏）
-const R429_SUSPEND_AFTER = 2;              // 当天累计提醒达 2 次 → 停用
-function markProvider429(providerName) {
+const R429_SUSPEND_AFTER = 2;              // 当天累计提醒达 2 次 → 停用（仅额度类）
+const R429_COOLDOWN_MS = 2000;             // 速率类 429 的冷却时长（RPS 是秒级窗口，2 秒足够满血）
+const provider429Cool = {};                // name -> 冷却截止时间戳
+function is429Cooling(name) { return !!(provider429Cool[name] && Date.now() < provider429Cool[name]); }
+function markProvider429(providerName, body) {
+  // 速率类判定：上游明确说是 rps/rate limit；额度类则是 quota/余额等
+  const text = String(body || '').toLowerCase();
+  const isRateLimit = /rps|rate.?limit|too many request/.test(text);
+  // ① 无论哪类，先给一个秒级冷却：避免同一秒内继续往这个站撞（这是治「被踢」的关键）
+  provider429Cool[providerName] = Date.now() + R429_COOLDOWN_MS;
+  computeProviderScore(providerName);
+
   const s = provider429[providerName] || (provider429[providerName] = { streak: 0, lastNotify: 0, notifyCount: 0 });
   s.streak++;
   if (s.streak >= R429_STREAK_THRESHOLD && Date.now() - s.lastNotify > R429_NOTIFY_COOLDOWN) {
     s.lastNotify = Date.now();
     s.notifyCount++;
-    const msg = `站点 ${providerName} 连续限流（429），提醒 ${s.notifyCount}/${R429_SUSPEND_AFTER} 次，可能已达免费额度上限`;
+    const kind = isRateLimit ? '请求速率超限(rps)' : '疑似额度用尽';
+    const msg = `站点 ${providerName} 连续限流（429：${kind}），提醒 ${s.notifyCount}/${R429_SUSPEND_AFTER} 次`;
     console.log(`  ⏳ ${msg}`);
     sendNotify(msg);
     addChangelog('自动', msg);
-    if (s.notifyCount >= R429_SUSPEND_AFTER) suspendProviderForQuota(providerName);
+    // ② 只有额度类才停用；速率类靠秒级冷却即可，停用它纯属误伤
+    if (!isRateLimit && s.notifyCount >= R429_SUSPEND_AFTER) suspendProviderForQuota(providerName);
   }
+}
+
+// ============ RPS 节流（按站「每秒请求上限」，从源头防撞上游 RPS 限速） ============
+// providers.json 每站可选配 "rps": N（0/不填 = 不限）。实测商汤 token.sensenova.cn 的
+// 上限约 4 rps，超了直接返回 {"error":{"message":"rps exhausted"}}。
+const rpsWindow = {};   // name -> [最近 1 秒内的请求时间戳]
+function canSendNow(name) {
+  const p = PROVIDERS[name];
+  const limit = (p && p.rps) || 0;
+  if (!limit) return true;                                   // 未配上限 = 不限速
+  const now = Date.now();
+  const arr = rpsWindow[name] || (rpsWindow[name] = []);
+  while (arr.length && now - arr[0] > 1000) arr.shift();      // 清掉 1 秒前的
+  return arr.length < limit;
+}
+function markSent(name) {
+  const p = PROVIDERS[name];
+  if (!p || !p.rps) return;
+  (rpsWindow[name] || (rpsWindow[name] = [])).push(Date.now());
 }
 
 // 停用限流站：enabled=false + disabledBy:'quota'（与 auto踢/手动停用区分），记录停用日期供午夜恢复判断
@@ -479,6 +513,10 @@ function sortCandidates(matches) {
   // 智能路由：按评分降序选当前最快可用站（同分用固定优先级 tiebreaker）
   if (settings.smartRouting !== false) {
     return [...matches].sort((a, b) => {
+      // RPS 本秒已满的站实时垫底（用滞后评分不够，这里现算），满站仍保留在末尾兜底
+      const ca = canSendNow(a.provider) ? 0 : 1;
+      const cb = canSendNow(b.provider) ? 0 : 1;
+      if (ca !== cb) return ca - cb;
       const sa = (providerScores[a.provider] || {}).score ?? -1;
       const sb = (providerScores[b.provider] || {}).score ?? -1;
       if (sb !== sa) return sb - sa;
@@ -528,6 +566,10 @@ function computeProviderScore(name) {
     if (probe && !probe.busy && !probe.ok && Date.now() - (probe.time || 0) < 45 * 60 * 1000) { score *= 0.3; detail.push('探活挂×0.3'); }
     // ⑤ 5xx 冷却中：探活可能仍绿（GET /models 通），但对话请求全 5xx，直接压到极低分垫底
     if (is5xxCooling(name)) { score = Math.min(score, 1); detail.push('5xx冷却'); }
+    // ⑥ 429 冷却中（速率限速）：秒级窗口，压到极低分让请求先走别的站，冷却结束自动恢复
+    if (is429Cooling(name)) { score = Math.min(score, 1); detail.push('429冷却'); }
+    // ⑦ 该站本秒 RPS 已达上限：压分垫底（配合 §RPS 节流），避免继续超速
+    if (!canSendNow(name)) { score = Math.min(score, 1); detail.push('RPS已满'); }
     providerScores[name] = { score: Math.round(score), detail: detail.join(' '), ms: lat == null ? null : Math.round(lat) };
   } catch (e) {
     providerScores[name] = { score: 0, detail: '评分出错' };
@@ -1766,6 +1808,7 @@ server = http.createServer((req, res) => {
       console.log(`  → ${cand.provider} ${opts.hostname}${opts.path}${aliasNote}`);
 
       const t0 = Date.now();
+      markSent(cand.provider); // 计入该站本秒 RPS 窗口（配合 canSendNow 节流）
       let result;
       try {
         result = await sendRequest(opts, targetBody);
@@ -1853,7 +1896,7 @@ server = http.createServer((req, res) => {
       if (shouldFailover(result.statusCode, result.body)) {
         markProviderFailed(cand.provider);
         if (result.statusCode >= 500) markProvider5xx(cand.provider); // 5xx 熔断计数
-        if (result.statusCode === 429) markProvider429(cand.provider); // 429 限流连击提醒
+        if (result.statusCode === 429) markProvider429(cand.provider, result.body); // 429：按类型（速率/额度）分别处理
         if (isModelLevelError(result.statusCode, result.body, isValidCompletion(result.body))) {
           markModelFailed(modelName);
         }

@@ -114,39 +114,56 @@ runGroup('5xx-breaker', `
 `);
 
 // ================================================================
-// 组3：429 提醒计数 + 两次提醒触发停用（mock 时钟）
+// 组3：429 分类型处理（速率类只冷却 / 额度类才停用）+ 提醒计数（mock 时钟）
 // ================================================================
 runGroup('429-suspend', `
   const __t = { v: 1000000 };
   function __now() { return __t.v; }
-  const console2 = console;
   const notified = [], suspended = [];
   function sendNotify(m) { notified.push(m); }
   function addChangelog(s, d) { }
   function suspendProviderForQuota(n) { suspended.push(n); }
+  function computeProviderScore() { }
+  const provider429Cool = {};
+  ${extractFn(routerSrc, 'is429Cooling').replace(/Date\.now\(\)/g, '__now()')}
   ${extractFn(routerSrc, 'markProvider429').replace(/Date\.now\(\)/g, '__now()')}
   ${extractConsts(routerSrc, 'R429_')}
   const provider429 = {};
 
-  // 第 1 轮：连 5 次 → 提醒 1
-  for (let i = 0; i < 4; i++) markProvider429('X');
+  // 第 1 轮：连 5 次额度类 429 → 提醒 1
+  for (let i = 0; i < 4; i++) markProvider429('X', 'quota exceeded');
   eq(notified.length, 0, '4连击未达提醒阈值');
-  markProvider429('X');
+  markProvider429('X', 'quota exceeded');
   eq(notified.length, 1, '5连击触发提醒1');
   eq(suspended.length, 0, '仅1次提醒不停用');
+  eq(is429Cooling('X'), true, '撞429后进入秒级冷却');
   // 冷却期内再连击 → 不重复提醒
-  for (let i = 0; i < 10; i++) markProvider429('X');
+  for (let i = 0; i < 10; i++) markProvider429('X', 'quota exceeded');
   eq(notified.length, 1, '10分钟冷却内不重复提醒');
   eq(suspended.length, 0, '冷却内提醒数不变不停用');
-  // 冷却过后连击 → 提醒 2 → 停用
+  // 冷却过后连击 → 提醒 2 → 额度类停用
   __t.v += 11 * 60 * 1000;
-  for (let i = 0; i < 5; i++) markProvider429('X');
+  for (let i = 0; i < 5; i++) markProvider429('X', 'quota exceeded');
   eq(notified.length, 2, '冷却过后触发提醒2');
-  eq(suspended.length, 1, '两次提醒触发停用');
+  eq(suspended.length, 1, '额度类两次提醒触发停用');
   eq(suspended[0], 'X', '停用的站名正确');
-  // 成功清零连击（直接操作状态验证语义）
-  provider429.X.streak = 0;
   eq(provider429.X.notifyCount, 2, 'notifyCount 当天不清零');
+
+  // 关键回归：速率类（rps exhausted）即使累计到 2 次提醒也绝不停用
+  const notified2 = [], suspended2 = [];
+  sendNotify = (m) => notified2.push(m);
+  suspendProviderForQuota = (n) => suspended2.push(n);
+  provider429.Y = { streak: 0, lastNotify: 0, notifyCount: 0 };
+  __t.v += 11 * 60 * 1000;
+  for (let i = 0; i < 5; i++) markProvider429('Y', '{"error":{"message":"rps exhausted"}}');
+  __t.v += 11 * 60 * 1000;
+  for (let i = 0; i < 5; i++) markProvider429('Y', '{"error":{"message":"rps exhausted"}}');
+  eq(notified2.length, 2, '速率类同样会提醒2次（告知用户）');
+  eq(suspended2.length, 0, '★速率类(rps)绝不停用——本次修复的核心');
+
+  // 秒级冷却会自然过期
+  __t.v += 3000;
+  eq(is429Cooling('X'), false, '3秒后429冷却自动解除');
 `);
 
 // ================================================================
