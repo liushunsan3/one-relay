@@ -114,6 +114,30 @@ runGroup('5xx-breaker', `
 `);
 
 // ================================================================
+// 组2b：findProviders —— 匹配忽略大小写，但转发必须用「配置里的原始模型名」
+//      （amd 的 DeepSeek-V4-Flash 严格区分大小写，用请求的小写名转发会 404）
+// ================================================================
+runGroup('findProviders-case', `
+  const PROVIDERS = {
+    'amd':  { baseUrl: 'x', key: 'k', models: ['DeepSeek-V4-Flash', 'GLM-5.3-Flash'], aliases: {}, enabled: true },
+    '商汤': { baseUrl: 'y', key: 'k', models: ['deepseek-v4-flash'], aliases: {}, enabled: true },
+    '别名站': { baseUrl: 'z', key: 'k', models: ['m-real'], aliases: { 'GPT': 'm-real' }, enabled: true },
+    '停用站': { baseUrl: 'w', key: 'k', models: ['deepseek-v4-flash'], aliases: {}, enabled: false },
+  };
+  ${extractFn(routerSrc, 'findProviders')}
+
+  const r = findProviders('deepseek-v4-flash');
+  eq(r.length, 2, '忽略大小写匹配到 2 个启用站（停用站不参与）');
+  eq(r.find(x => x.provider === 'amd').realModel, 'DeepSeek-V4-Flash', '★amd 转发用配置原始名（大小写敏感）');
+  eq(r.find(x => x.provider === '商汤').realModel, 'deepseek-v4-flash', '商汤转发其配置名');
+  // 别名映射优先，且用别名目标名转发
+  const a = findProviders('gpt');
+  eq(a.length, 1, '别名匹配');
+  eq(a[0].realModel, 'm-real', '别名转发映射目标名');
+  eq(findProviders('不存在的模型').length, 0, '无匹配返回空');
+`);
+
+// ================================================================
 // 组3：429 分类型处理（速率类只冷却 / 额度类才停用）+ 提醒计数（mock 时钟）
 // ================================================================
 runGroup('429-suspend', `

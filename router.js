@@ -54,7 +54,8 @@ function loadProviders(list) {
   for (const p of list) {
     map[p.name] = {
       baseUrl: p.baseUrl, key: p.key, models: p.models, aliases: p.aliases || {}, enabled: p.enabled !== false,
-      rps: Number(p.rps) > 0 ? Number(p.rps) : 0, // 该站每秒请求上限（0=不限），用于避免撞上游 RPS 限速
+      rps: Number(p.rps) > 0 ? Number(p.rps) : 0, // 该站每秒请求上限（0=不限），避免撞上游 RPS 限速
+      rpm: Number(p.rpm) > 0 ? Number(p.rpm) : 0, // 该站每分钟请求上限（0=不限），应对 RPM/TPM 型配额
     };
   }
   return map;
@@ -297,30 +298,47 @@ function markProvider429(providerName, body) {
   }
 }
 
-// ============ RPS 节流（按站「每秒请求上限」，从源头防撞上游 RPS 限速） ============
-// providers.json 每站可选配 "rps": N（0/不填 = 不限）。实测商汤 token.sensenova.cn 的
-// 上限约 4 rps，超了直接返回 {"error":{"message":"rps exhausted"}}。
+// ============ 限速节流（按站「每秒 / 每分钟请求上限」，从源头防撞上游限速） ============
+// providers.json 每站可选配 "rps": N（每秒）与 "rpm": N（每分钟），0/不填 = 不限。
+// 实测：商汤 token.sensenova.cn 的 sensenova 系模型约 4 rps，而 deepseek-v4-flash 仅 1 rpm
+//（响应体 {"message":"inference exceeds tpm/rpm limit","type":"rate_limit_error"}）。
 const rpsWindow = {};   // name -> [最近 1 秒内的请求时间戳]
+const rpmWindow = {};   // name -> [最近 60 秒内的请求时间戳]
 function canSendNow(name) {
   const p = PROVIDERS[name];
-  const limit = (p && p.rps) || 0;
-  if (!limit) return true;                                   // 未配上限 = 不限速
+  if (!p) return true;
   const now = Date.now();
-  const arr = rpsWindow[name] || (rpsWindow[name] = []);
-  while (arr.length && now - arr[0] > 1000) arr.shift();      // 清掉 1 秒前的
-  return arr.length < limit;
+  if (p.rps) {
+    const arr = rpsWindow[name] || (rpsWindow[name] = []);
+    while (arr.length && now - arr[0] > 1000) arr.shift();       // 清掉 1 秒前的
+    if (arr.length >= p.rps) return false;
+  }
+  if (p.rpm) {
+    const arr = rpmWindow[name] || (rpmWindow[name] = []);
+    while (arr.length && now - arr[0] > 60000) arr.shift();      // 清掉 1 分钟前的
+    if (arr.length >= p.rpm) return false;
+  }
+  return true;
 }
 function markSent(name) {
   const p = PROVIDERS[name];
-  if (!p || !p.rps) return;
-  (rpsWindow[name] || (rpsWindow[name] = [])).push(Date.now());
+  if (!p) return;
+  const now = Date.now();
+  if (p.rps) (rpsWindow[name] || (rpsWindow[name] = [])).push(now);
+  if (p.rpm) (rpmWindow[name] || (rpmWindow[name] = [])).push(now);
 }
-// 供面板显示「当前秒已用/上限」
+// 供面板显示「当前已用/上限」
 function rpsNowCount(name) {
   const arr = rpsWindow[name];
   if (!arr || !arr.length) return 0;
   const now = Date.now();
   return arr.filter(t => now - t <= 1000).length;
+}
+function rpmNowCount(name) {
+  const arr = rpmWindow[name];
+  if (!arr || !arr.length) return 0;
+  const now = Date.now();
+  return arr.filter(t => now - t <= 60000).length;
 }
 
 // 停用限流站：enabled=false + disabledBy:'quota'（与 auto踢/手动停用区分），记录停用日期供午夜恢复判断
@@ -512,8 +530,11 @@ function findProviders(modelName) {
       matches.push({ provider: providerName, config: p, realModel: alias[1] });
       continue;
     }
-    if (p.models.some(m => m.toLowerCase() === name)) {
-      matches.push({ provider: providerName, config: p, realModel: name });
+    // 匹配忽略大小写，但转发必须用「该站配置里的原始模型名」——有些站（如 amd 的 DeepSeek-V4-Flash）
+    // 严格区分大小写，用小写请求名转发会被判 404 model not available
+    const hit = p.models.find(m => m.toLowerCase() === name);
+    if (hit) {
+      matches.push({ provider: providerName, config: p, realModel: hit });
     }
   }
   return matches;
@@ -579,8 +600,8 @@ function computeProviderScore(name) {
     if (is5xxCooling(name)) { score = Math.min(score, 1); detail.push('5xx冷却'); }
     // ⑥ 429 冷却中（速率限速）：秒级窗口，压到极低分让请求先走别的站，冷却结束自动恢复
     if (is429Cooling(name)) { score = Math.min(score, 1); detail.push('429冷却'); }
-    // ⑦ 该站本秒 RPS 已达上限：压分垫底（配合 §RPS 节流），避免继续超速
-    if (!canSendNow(name)) { score = Math.min(score, 1); detail.push('RPS已满'); }
+    // ⑦ 该站已达限速上限（每秒/每分钟）：压分垫底，避免继续超速
+    if (!canSendNow(name)) { score = Math.min(score, 1); detail.push('限速已满'); }
     providerScores[name] = { score: Math.round(score), detail: detail.join(' '), ms: lat == null ? null : Math.round(lat) };
   } catch (e) {
     providerScores[name] = { score: 0, detail: '评分出错' };
@@ -1442,7 +1463,9 @@ async function handleAdmin(req, res, reqUrl) {
       aliases: cfg.aliases, enabled: cfg.enabled !== false,
       rps: cfg.rps || 0,                    // 每秒请求上限（0=不限）
       rpsNow: rpsNowCount(name),            // 当前秒已用
-      cooling429: is429Cooling(name),       // 是否在 429 秒级冷却中
+      rpm: cfg.rpm || 0,                    // 每分钟请求上限（0=不限）
+      rpmNow: rpmNowCount(name),            // 当前分钟已用
+      cooling429: is429Cooling(name),       // 是否在 429 冷却中
       disabledBy: (providerList.find(x => x.name === name) || {}).disabledBy || null,
       score: providerScores[name] || null,
       failures: providerHealth[name] ? providerHealth[name].failures : 0,
@@ -1797,9 +1820,9 @@ server = http.createServer((req, res) => {
     const modelName = parsed.model || '';
     const clientId = ++clientSeq;
     const candidates = sortCandidates(findProviders(modelName)).filter(c => isProviderHealthy(c.provider));
-    const tryList = candidates.length > 0 ? candidates : sortCandidates(findProviders(modelName));
+    const rawList = candidates.length > 0 ? candidates : sortCandidates(findProviders(modelName));
 
-    if (tryList.length === 0) {
+    if (rawList.length === 0) {
       const available = availableModels();
       const preview = available.slice(0, 20).join(', ') + (available.length > 20 ? ` …（共 ${available.length} 个）` : '');
       res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -1815,7 +1838,27 @@ server = http.createServer((req, res) => {
 
     let lastError = null;
 
-    for (const cand of tryList) {
+    // 跳过已达限速上限（rps/rpm）的站：它们再打只会 429，白白浪费上游配额。
+    // 若所有候选都满，则不再硬打，直接告知客户端稍后重试（避免制造一串 429）。
+    const sendable = rawList.filter(c => canSendNow(c.provider));
+    if (sendable.length === 0) {
+      const limits = rawList.map(c => {
+        const p = PROVIDERS[c.provider] || {};
+        return `${c.provider}(${p.rpm ? p.rpm + '/分' : ''}${p.rps ? (p.rpm ? ' ' : '') + p.rps + '/秒' : ''})`;
+      }).join('、');
+      console.log(`  ⏸️ ${modelName}: 所有候选站均达限速上限 [${limits}]，本轮不再硬打`);
+      res.writeHead(429, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        error: {
+          message: `模型 "${modelName}" 的所有站均已达限速上限 [${limits}]，请稍后重试`,
+          type: 'rate_limit_exceeded',
+        }
+      }));
+      recordClientResult(false);
+      return;
+    }
+
+    for (const cand of sendable) {
       const targetBody = JSON.stringify(sanitizeBody(parsed, cand.realModel));
       const opts = buildOptions(cand, upstreamPath, targetBody);
       const aliasNote = cand.realModel !== modelName ? ` (${modelName} → ${cand.realModel})` : '';
@@ -1926,7 +1969,7 @@ server = http.createServer((req, res) => {
       return;
     }
 
-    console.log(`  💥 所有provider都失败 (尝试了${tryList.length}个)`);
+    console.log(`  💥 所有provider都失败 (尝试了${sendable.length}个)`);
     recordClientResult(false);
     if (lastError) {
       res.writeHead(lastError.statusCode, lastError.headers);
