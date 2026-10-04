@@ -25,3 +25,4 @@ s36*.sh
 tunnel_all.sh
 
 sync-github.cjs
+sticky.json  

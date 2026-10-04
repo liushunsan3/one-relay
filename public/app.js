@@ -146,6 +146,8 @@ function renderStatus(s) {
       ${rs.stopped ? '<span class="k" style="color:var(--bad)">自动重启</span><span style="color:var(--bad)">已停止（配置错误），请从托盘「重启服务」恢复</span>' : ''}
       <span class="k">探活间隔</span><span>${s.probeIntervalMin} 分钟</span>
       <span class="k">Provider</span><span>${s.providers.length} 个站 / ${s.models.length} 个模型</span>
+      <span class="k">缓存命中(今日)</span><span title="粘性路由的验证指标：同一对话粘住同一个站时此值上升">${s.cacheHitRate == null ? '—' : s.cacheHitRate + '%'}</span>
+      ${(() => { const sk = Object.entries(s.sticky || {}); const tn = Object.entries(s.tentative || {}); if (!sk.length && !tn.length) return ''; const seg = sk.map(([m, v]) => `${escapeHtml(m)} → ${escapeHtml(v.station)}`).join('、') + tn.map(([m, v]) => `${escapeHtml(m)} ⇢ ${escapeHtml(v.station)}(暂替)`).join('、'); return `<span class="k" title="粘性路由：模型当前偏好的站；⇢暂替=粘性站暂不可用时的承接者">粘性路由</span><span>${seg}</span>`; })()}
       ${s.kickedCount > 0 ? `<span class="k" style="color:var(--bad)">已踢出</span><span style="color:var(--bad)">${s.kickedCount} 个废站（Provider 页可清理/恢复）</span>` : ''}
     </div>`;
 

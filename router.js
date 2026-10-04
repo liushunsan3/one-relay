@@ -190,6 +190,11 @@ fs.watchFile(configPath, { interval: 1000 }, () => {
       for (const n of Object.keys(providerHealth)) if (!names.has(n)) delete providerHealth[n];
       for (const n of Object.keys(probeState)) if (!names.has(n)) delete probeState[n];
       for (const n of Object.keys(PROVIDERS)) computeProviderScore(n); // 配置变化后评分全量重算
+      // 粘性自愈：粘性站被删除/停用后清除对应粘性（WB-004 生命周期）
+      for (const mk of Object.keys(stickyTable)) {
+        const st = stickyTable[mk].station;
+        if (!PROVIDERS[st] || PROVIDERS[st].enabled === false) stickyClear(mk, '粘性站被删除或停用');
+      }
       const allModels = [...new Set(Object.values(PROVIDERS).flatMap(p => [...p.models, ...Object.keys(p.aliases)]))];
       broadcast('providers'); broadcast('status'); // 站点增删/启停/kick 等配置变更 → 面板实时刷新
       broadcast('memory'); // changelog 可能新增
@@ -520,6 +525,79 @@ function fixTool(tool) {
 }
 
 // ============ 路由逻辑 ============
+// ============ 粘性路由（Winner Stays，WB-004 评审定稿） ============
+// 分层原则：可用性/配额=硬约束（一票否决）；粘性=强偏好（命中即首选，跳过评分）；
+// 评分=仅在必须换站时用的一次性选择器。防抖主力是「换站静默期」而非分数门槛。
+const stickyTable = {};                     // model(小写) -> { station, since, lastSwitchAt }
+const stickyTentative = {};                 // model -> { station, since }（粘性站暂不可用时承接者，仅内存不落盘）
+const SWITCH_COOLDOWN_MS = 300 * 1000;      // 换站静默期：除硬失败外 5 分钟内不再次换站
+const DEGRADE_TOTAL_RATIO = 1.5;            // 劣化复核阈值：粘性站 EMA 延迟 > 最优 ×1.5 → 触发重选
+const STICKY_WAIT_CAP_MS = 1500;            // 粘性站限速满时的有界等待上限（等待保缓存优于换站烧缓存）
+const STICKY_FILE = path.join(APP_DIR, 'sticky.json');
+let stickyDirty = false;
+try { Object.assign(stickyTable, JSON.parse(fs.readFileSync(STICKY_FILE, 'utf8'))); } catch (e) {}
+function logSwitch(model, from, to, reason) {
+  console.log(`  🔀 换站 [${model}] ${from} → ${to}（${reason}）`);
+}
+function stickySet(model, station, reason) {
+  const prev = stickyTable[model];
+  if (prev && prev.station === station) return;
+  stickyTable[model] = { station, since: Date.now(), lastSwitchAt: Date.now() };
+  delete stickyTentative[model];
+  stickyDirty = true;
+  logSwitch(model, prev ? prev.station : '(初始化)', station, reason);
+}
+// TENTATIVE 承接：不写粘性表（保留原粘性记录，原站恢复后自动回切），仅记录实际承接者供观测
+function stickyKeep(model, station) {
+  if (!stickyTable[model] || stickyTable[model].station !== station) stickyTentative[model] = { station, since: Date.now() };
+}
+function stickyClear(model, reason) {
+  if (stickyTable[model]) { logSwitch(model, stickyTable[model].station, '(清除)', reason); delete stickyTable[model]; stickyDirty = true; }
+  delete stickyTentative[model];
+}
+function stickySave() {
+  if (!stickyDirty) return;
+  try { atomicWrite(STICKY_FILE, JSON.stringify(stickyTable, null, 2)); stickyDirty = false; } catch (e) {}
+}
+setInterval(stickySave, 30000).unref();
+// 成功归因：初始化/粘性站自己成功才写粘性；TENTATIVE 承接成功不覆盖（保留回切能力）
+function stickyOnSuccess(model, station) {
+  const key = String(model || '').toLowerCase();
+  const s = stickyTable[key];
+  if (!s) stickySet(key, station, '初始化');
+  else if (s.station === station) delete stickyTentative[key];
+}
+
+// ============ 路由指标：EMA（站×模型双维度）+ Wilson 下界（WB-004 评审定稿） ============
+// 成功率用 Wilson 下界（衰减计数+Beta先验）：一个公式同时解决冷启动平滑/奖励低方差/无台阶跳变。
+// 延迟用 EMA 总时长（流式与非流式都记「完整响应时长」，语义一致）；TTFB 单独一条 EMA 供粘性复核与面板。
+const emaByProv = {};   // provider -> { total, ttfb, ok, n }（衰减计数，等效 ~50 次窗口）
+const emaByPM = {};     // `${prov}|${model}` -> 同结构（粘性劣化复核用）
+const EMA_ALPHA = 0.3;
+function emaHit(map, key, totalMs, ok, ttfbMs) {
+  const e = map[key] || (map[key] = { total: null, ttfb: null, ok: 0, n: 0 });
+  e.n = e.n * 0.98 + 1;
+  e.ok = e.ok * 0.98 + (ok ? 1 : 0);
+  if (totalMs != null) e.total = e.total == null ? totalMs : e.total * (1 - EMA_ALPHA) + totalMs * EMA_ALPHA;
+  if (ttfbMs != null) e.ttfb = e.ttfb == null ? ttfbMs : e.ttfb * (1 - EMA_ALPHA) + ttfbMs * EMA_ALPHA;
+  return e;
+}
+function wilsonLower(ok, n, z) {
+  z = z || 1.96;
+  if (n < 5) return 0.7;  // 冷启动继承原「乐观 70%」语义防新站饿死（Wilson 置信下界天生保守，直接用会把新站压死）；攒够 5 个样本进入 Wilson 判定
+  const p = ok / n;
+  const denom = 1 + z * z / n;
+  const centre = p + z * z / (2 * n);
+  const adj = z * Math.sqrt(p * (1 - p) / n + z * z / (4 * n * n));
+  return (centre - adj) / denom;
+}
+
+// ============ 在途请求计数（并发分流） ============
+// 某站在途请求堆积时排序垫底，避免并发请求全部堆到同一个（可能正卡住的）站——
+// 这是「粘性集中 vs 并发分流」矛盾的轻量缓解（WB-004 评审 1.1 的运行时补充）
+const inflight = {};
+function inflightOf(name) { return inflight[name] || 0; }
+
 function findProviders(modelName) {
   const name = (modelName || '').toLowerCase();
   const matches = [];
@@ -549,6 +627,10 @@ function sortCandidates(matches) {
       const ca = canSendNow(a.provider) ? 0 : 1;
       const cb = canSendNow(b.provider) ? 0 : 1;
       if (ca !== cb) return ca - cb;
+      // 有在途请求的站垫底（并发分流：新请求优先去空闲站，避免全堆到同一个可能正卡住的站）
+      const fa = inflightOf(a.provider) >= 1 ? 1 : 0;
+      const fb = inflightOf(b.provider) >= 1 ? 1 : 0;
+      if (fa !== fb) return fa - fb;
       const sa = (providerScores[a.provider] || {}).score ?? -1;
       const sb = (providerScores[b.provider] || {}).score ?? -1;
       if (sb !== sa) return sb - sa;
@@ -575,60 +657,67 @@ function computeProviderScore(name) {
     const probedOk = probe && probe.ok;
     let score = 0;
     const detail = [];
-    // ① 探活基础分 40
-    if (probedOk) { score += 40; detail.push('探活+40'); }
-    // ② 成功率 40：当日分桶，样本≥5 用真实值；不足按乐观 70%（防新站/凌晨饿死；恰好样本全败用真实值）
-    const b = stats[todayKey()];
-    const cell = b && b.byProvider[name];
-    let rate = 0.7;
-    if (cell && cell.reqs >= 5) rate = cell.ok / cell.reqs;
-    score += rate * 40;
-    detail.push(`成功率${Math.round(rate * 100)}%+${Math.round(rate * 40)}`);
-    // ③ 延迟分 20：当日有真实请求用请求平均延迟（比探活延迟准），否则探活延迟
-    let lat = null;
-    if (cell && cell.reqs > 0) lat = cell.ms / cell.reqs;
-    else if (probedOk) lat = probe.ms;
+    // ① 探活门槛分 15（探活≠推理可用，权重从 40 降至 15，余量让给真实请求指标；探活失败仍 ×0.3 门槛压制）
+    if (probedOk) { score += 15; detail.push('探活+15'); }
+    // ② 成功率 40：Wilson 下界（EMA 衰减计数 + Beta 先验）——冷启动平滑/奖励低方差/无台阶跳变，不依赖日历日
+    const e = emaByProv[name];
+    const wil = wilsonLower(e ? e.ok : 0, e ? e.n : 0);
+    score += wil * 40;
+    detail.push(`成功率${Math.round(wil * 100)}%+${Math.round(wil * 40)}`);
+    // ③ 延迟 20：EMA 总时长（近期权重高，消除"当天平均"滞后与零点重置潮）；无数据用探活延迟
+    let lat = e && e.total != null ? e.total : null;
+    if (lat == null && probedOk) lat = probe.ms;
     if (lat != null) {
       const d = Math.max(0, (2000 - lat) / 2000) * 20;
       score += d;
       detail.push(`延迟${Math.round(lat)}ms+${Math.round(d)}`);
     }
-    // ④ 探活不通：总分 ×0.3 封顶（刚挂的站不被历史高分误选）。
-    //    但结果超过 45 分钟（1.5 个探活周期）视为过期数据不采信——断网期间的陈旧失败不该一直压分
+    // ④ 探活不通：总分 ×0.3 封顶（结果超 45 分钟视为过期不采信——断网期间的陈旧失败不该一直压分）
     if (probe && !probe.busy && !probe.ok && Date.now() - (probe.time || 0) < 45 * 60 * 1000) { score *= 0.3; detail.push('探活挂×0.3'); }
-    // ⑤ 5xx 冷却中：探活可能仍绿（GET /models 通），但对话请求全 5xx，直接压到极低分垫底
+    // ⑤ 5xx 冷却中：压到极低分垫底
     if (is5xxCooling(name)) { score = Math.min(score, 1); detail.push('5xx冷却'); }
-    // ⑥ 429 冷却中（速率限速）：秒级窗口，压到极低分让请求先走别的站，冷却结束自动恢复
+    // ⑥ 429 冷却中（速率/分钟配额）：垫底，冷却结束自动恢复
     if (is429Cooling(name)) { score = Math.min(score, 1); detail.push('429冷却'); }
-    // ⑦ 该站已达限速上限（每秒/每分钟）：压分垫底，避免继续超速
+    // ⑦ 该站已达限速上限（每秒/每分钟）：垫底，避免继续超速
     if (!canSendNow(name)) { score = Math.min(score, 1); detail.push('限速已满'); }
     providerScores[name] = { score: Math.round(score), detail: detail.join(' '), ms: lat == null ? null : Math.round(lat) };
-  } catch (e) {
+  } catch (err) {
     providerScores[name] = { score: 0, detail: '评分出错' };
   }
 }
 
 // ============ 发送请求（支持流式透传） ============
+const HEAD_TIMEOUT = 45000; // 响应头绝对超时：空闲超时管不住「接受连接但慢慢滴数据」的假活站，必须加绝对上限
 function sendRequest(options, body) {
   return new Promise((resolve, reject) => {
     const transport = options.protocol === 'https:' ? https : http;
+    let settled = false;
+    let headTimer = null;
+    const done = (fn, arg) => { if (!settled) { settled = true; if (headTimer) clearTimeout(headTimer); fn(arg); } };
     const req = transport.request(options, (proxyRes) => {
+      if (headTimer) { clearTimeout(headTimer); headTimer = null; } // 响应头已到，绝对超时使命完成（后续流式传输不受限）
       const contentType = proxyRes.headers['content-type'] || '';
       if (proxyRes.statusCode === 200 && contentType.includes('text/event-stream')) {
-        resolve({ statusCode: proxyRes.statusCode, headers: proxyRes.headers, stream: proxyRes });
+        done(resolve, { statusCode: proxyRes.statusCode, headers: proxyRes.headers, stream: proxyRes });
         return;
       }
       let data = '';
       proxyRes.on('data', chunk => { data += chunk; });
       proxyRes.on('end', () => {
-        resolve({ statusCode: proxyRes.statusCode, headers: proxyRes.headers, body: data });
+        done(resolve, { statusCode: proxyRes.statusCode, headers: proxyRes.headers, body: data });
       });
     });
 
+    headTimer = setTimeout(() => {
+      console.log(`  ⏰ [响应头超时 ${HEAD_TIMEOUT}ms] ${options.hostname}${options.path} 强制断开`);
+      req.destroy(new Error('响应头超时'));
+    }, HEAD_TIMEOUT);
     req.setTimeout(UPSTREAM_TIMEOUT, () => {
+      console.log(`  ⏰ [socket 空闲超时 ${UPSTREAM_TIMEOUT}ms] ${options.hostname}`);
       req.destroy(new Error('upstream timeout'));
     });
-    req.on('error', reject);
+    req.on('socket', (s) => { s.on('lookup', (err) => { if (err) console.log(`  ⚠️ DNS 解析失败 ${options.hostname}: ${err.message}`); }); });
+    req.on('error', (e) => { console.log(`  ✗ [req error] ${options.hostname}: ${e.message}`); done(reject, e); });
     req.write(body);
     req.end();
   });
@@ -659,8 +748,11 @@ function buildOptions(cand, upstreamPath, targetBody) {
   };
 }
 
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 10 });
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 10 });
+// keep-alive 关闭：上游中转站经常静默关闭空闲连接，客户端复用僵尸 socket 会「写进死连接、无响应」挂死
+// （实测小米站直连 0.2s 秒回 402，但代理侧因复用僵尸连接挂满 120s）。每次新建连接的代价（~200ms TLS）
+// 远小于挂死代价，故不复用连接。
+const httpsAgent = new https.Agent({ keepAlive: false });
+const httpAgent = new http.Agent({ keepAlive: false });
 
 // ============ 用量统计（按天分桶）+ 请求历史 ============
 const statsPath = path.join(APP_DIR, 'stats.json');
@@ -706,7 +798,7 @@ function cachedTokens(usage) {
     return (usage && usage.prompt_tokens_details && usage.prompt_tokens_details.cached_tokens) || 0;
   } catch (e) { return 0; }
 }
-function recordAttempt(model, provider, ms, code, ok, stream, usage) {
+function recordAttempt(model, provider, ms, code, ok, stream, usage, ttfb) {
   const b = todayBucket();
   const p = ensureCell(b.byProvider, provider);
   p.reqs++; ok ? p.ok++ : p.fail++; p.ms += ms;
@@ -716,6 +808,9 @@ function recordAttempt(model, provider, ms, code, ok, stream, usage) {
   if (usage) { m.tin += usage.prompt_tokens || 0; m.tout += usage.completion_tokens || 0; m.cached += cachedTokens(usage); }
   reqHistory.push({ t: Date.now(), model, provider, ms: Math.round(ms), code, ok, stream: !!stream });
   if (reqHistory.length > 200) reqHistory.splice(0, reqHistory.length - 200);
+  // EMA 双维度（站 / 站×模型）：评分与粘性劣化复核的数据源；ttfb 仅流式有
+  emaHit(emaByProv, provider, ms, ok, ttfb);
+  emaHit(emaByPM, provider + '|' + String(model || '').toLowerCase(), ms, ok, ttfb);
   computeProviderScore(provider); // 评分随请求实时更新
   scheduleStatsSave();
   broadcast('status'); broadcast('providers'); broadcast('stats'); // 面板实时刷新：评分/请求历史/用量统计
@@ -853,6 +948,8 @@ async function kickProvider(name) {
     probeFailStreak[name] = 0;
     delete probeState[name]; // 停止探活展示（杜绝「已踢出+探活绿」矛盾）
     computeProviderScore(name); // 评分归 -1（UI 不显示旧正分）
+    // 清除各模型对该站的粘性（WB-004 生命周期：站没了粘性必须跟着走）
+    for (const mk of Object.keys(stickyTable)) if (stickyTable[mk].station === name) stickyClear(mk, '粘性站被自动踢出');
     addChangelog('自动', `踢出废站 ${name}（探活连续失败+复验确认）${lostNote}`);
     sendNotify(`站点 ${name} 已自动踢出${lostNote}。可在 Provider 页手动启用或一键清理`);
     console.log(`  🥊 已自动踢出废站: ${name}${lostNote}`);
@@ -1474,6 +1571,10 @@ async function handleAdmin(req, res, reqUrl) {
       availableModels: [...new Set([...cfg.models, ...Object.keys(cfg.aliases)])].filter(m => !isModelUnavailable(m)),
     }));
     const a = settings.assistant || {};
+    // 缓存命中率（当天口径，趋势指标）：cached/prompt_tokens
+    let tinSum = 0, cachedSum = 0;
+    const tb = stats[todayKey()];
+    if (tb) for (const c of Object.values(tb.byProvider || {})) { tinSum += c.tin || 0; cachedSum += c.cached || 0; }
     sendJSON(res, 200, {
       port: MY_PORT,
       uptime: Math.floor((Date.now() - startedAt) / 1000),
@@ -1486,6 +1587,9 @@ async function handleAdmin(req, res, reqUrl) {
       bindLan: settings.bindLan === true,
       lanIP: currentHost === '0.0.0.0' ? (lanIPv4() || '') : '',
       apiKeyMasked: maskKey(settings.apiKey),
+      cacheHitRate: tinSum > 0 ? Math.round(cachedSum / tinSum * 100) : null,
+      sticky: stickyTable,
+      tentative: stickyTentative,
       assistant: { baseUrl: a.baseUrl, keyMasked: maskKey(a.key), model: a.model || '' },
       probeIntervalMin: settings.probeIntervalMin,
     });
@@ -1805,6 +1909,10 @@ server = http.createServer((req, res) => {
   }
 
   let body = '';
+  let clientGone = false; // WB-004: 客户端主动断开，不计指标
+  // ⚠️ 必须用 ServerResponse 的 close + writableEnded 判定：IncomingMessage(req) 的 'close'
+  // 在 Node ≥16 表示「请求体已读完」（正常完成也触发），用它判 clientGone 会让所有非流式请求被误判为断开而挂死。
+  res.on('close', () => { if (!res.writableEnded) clientGone = true; });
   req.on('data', chunk => { body += chunk; });
   req.on('end', async () => {
     try {
@@ -1847,7 +1955,7 @@ server = http.createServer((req, res) => {
         return `${c.provider}(${p.rpm ? p.rpm + '/分' : ''}${p.rps ? (p.rpm ? ' ' : '') + p.rps + '/秒' : ''})`;
       }).join('、');
       console.log(`  ⏸️ ${modelName}: 所有候选站均达限速上限 [${limits}]，本轮不再硬打`);
-      res.writeHead(429, { 'Content-Type': 'application/json' });
+      res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '30' }); // WB-004: 429 带 Retry-After 供客户端退避
       res.end(JSON.stringify({
         error: {
           message: `模型 "${modelName}" 的所有站均已达限速上限 [${limits}]，请稍后重试`,
@@ -1858,7 +1966,60 @@ server = http.createServer((req, res) => {
       return;
     }
 
-    for (const cand of sendable) {
+    // ===== 粘性路由（分层：命中即首选并跳过评分比较；与可用性解耦，TENTATIVE 承接不清粘性） =====
+    const modelKey = String(modelName || '').toLowerCase();
+    const sticky = stickyTable[modelKey];
+    let stickyCand = null;
+    if (sticky) {
+      const sc = sendable.find(x => x.provider === sticky.station);
+      if (sc) {
+        // 粘性站健康：劣化复核（过了换站静默期才比较，EMA 样本充足才可信）
+        const curEma = emaByProv[sticky.station];
+        if (Date.now() - (sticky.lastSwitchAt || 0) > SWITCH_COOLDOWN_MS && curEma && curEma.total != null && curEma.n >= 5) {
+          let bestTotal = null;
+          for (const x of sendable) {
+            const e2 = emaByProv[x.provider];
+            if (e2 && e2.total != null && (bestTotal == null || e2.total < bestTotal)) bestTotal = e2.total;
+          }
+          if (bestTotal != null && curEma.total > bestTotal * DEGRADE_TOTAL_RATIO) {
+            const bestCand = sendable.find(x => emaByProv[x.provider] && emaByProv[x.provider].total === bestTotal);
+            if (bestCand && bestCand.provider !== sticky.station) {
+              stickySet(modelKey, bestCand.provider, '劣化复核:EMA延迟劣化超50%');
+              stickyCand = bestCand;
+            }
+          }
+        }
+        if (!stickyCand) stickyCand = sc; // 粘性站首选（跳过评分比较）
+        delete stickyTentative[modelKey]; // 粘性站恢复承接，清 TENTATIVE
+      } else if (rawList.some(x => x.provider === sticky.station)) {
+        // 粘性站在候选里但被排除（限速满/冷却）：TENTATIVE 承接，保留粘性记录等回切
+        stickyKeep(modelKey, sticky.station);
+        // 有界等待档：仅「限速满」（无 429 冷却）时值得等——换站烧缓存，等待成本更低
+        if (!is429Cooling(sticky.station)) {
+          const ok = await (async () => {
+            const deadline = Date.now() + STICKY_WAIT_CAP_MS;
+            while (Date.now() < deadline) {
+              await new Promise(r => setTimeout(r, 300));
+              if (canSendNow(sticky.station)) return true;
+            }
+            return false;
+          })();
+          if (ok) {
+            const waited = rawList.find(x => x.provider === sticky.station);
+            if (waited) { stickyCand = waited; delete stickyTentative[modelKey]; }
+          }
+        }
+        if (!stickyCand) console.log(`  🧷 [${modelKey}] 粘性站 ${sticky.station} 暂不可用，由备选承接（粘性保留，恢复后回切）`);
+      } else {
+        stickyClear(modelKey, '粘性站不可用(被停用或不支持该模型)'); // 只剩这种情况才真正清除粘性
+      }
+    }
+
+    // 顺序：粘性命中 → 粘性站第一（跳过评分比较）；否则按评分序。TENTATIVE 承接记录当前实际承接者
+    const order = stickyCand ? [stickyCand, ...sendable.filter(x => x !== stickyCand)] : sendable;
+    if (!stickyCand && sticky && order[0]) stickyKeep(modelKey, order[0].provider);
+
+    for (const cand of order) {
       const targetBody = JSON.stringify(sanitizeBody(parsed, cand.realModel));
       const opts = buildOptions(cand, upstreamPath, targetBody);
       const aliasNote = cand.realModel !== modelName ? ` (${modelName} → ${cand.realModel})` : '';
@@ -1866,10 +2027,12 @@ server = http.createServer((req, res) => {
 
       const t0 = Date.now();
       markSent(cand.provider); // 计入该站本秒 RPS 窗口（配合 canSendNow 节流）
+      inflight[cand.provider] = (inflight[cand.provider] || 0) + 1; // 在途 +1（响应头到达或失败后 -1）
       let result;
       try {
         result = await sendRequest(opts, targetBody);
       } catch (e) {
+        inflight[cand.provider]--;
         markProviderFailed(cand.provider);
         markProvider5xx(cand.provider); // 网络错误/超时同样计入 5xx 熔断
         console.log(`  ✗ ${cand.provider} 网络错误: ${e.message}`);
@@ -1877,6 +2040,7 @@ server = http.createServer((req, res) => {
         lastError = { statusCode: 502, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: { message: `${cand.provider}: ${e.message}`, type: 'proxy_error' } }) };
         continue;
       }
+      inflight[cand.provider] = Math.max(0, (inflight[cand.provider] || 0) - 1); // 响应头已到（或错误已归因），在途 -1
 
   if (result.stream) {
     markProviderSuccess(cand.provider);
@@ -1888,8 +2052,11 @@ server = http.createServer((req, res) => {
     // 流式 usage 解析：只保留尾部 chunk，在流结束时解析一次（避免每个 chunk 全量扫描占满主线程，
     // opus/thinking 等长流会产生海量 chunk，逐块扫描会拖垮主线程导致健康检查超时误判僵尸）
     let usageTail = '';
+    let ttfb = null; // 首字节延迟：首个「非空 delta」的时间（防伪流式：空 chunk 保活不计）
     stream.on('data', (chunk) => {
-      usageTail = (usageTail + chunk.toString('utf8')).slice(-16384); // 只留尾部 16KB
+      const s = chunk.toString('utf8');
+      if (ttfb == null && /"delta":\{[^}]*"(content|reasoning)/.test(s)) ttfb = Date.now() - t0;
+      usageTail = (usageTail + s).slice(-16384); // 只留尾部 16KB
     });
     function parseUsageFromTail() {
       let searchFrom = usageTail.length;
@@ -1913,17 +2080,20 @@ server = http.createServer((req, res) => {
     }
     // 流式延迟 = 完整流式时长（end 或客户端断开 close 都记录，只记一次）
     let streamRecorded = false;
+    let clientGone = false; // 客户端主动断流不算站的失败/成功，不污染任何指标
     const recordStream = () => {
       if (streamRecorded) return;
       streamRecorded = true;
       try { parseUsageFromTail(); } catch (e) {}
-      recordAttempt(modelName, cand.provider, Date.now() - t0, 200, true, true, null);
+      if (clientGone) return; // WB-004 评审：abort 不计指标
+      recordAttempt(modelName, cand.provider, Date.now() - t0, 200, true, true, null, ttfb);
+      stickyOnSuccess(String(modelName || '').toLowerCase(), cand.provider);
     };
     stream.on('end', recordStream);
     stream.on('close', recordStream);
     stream.pipe(res);
-    // 客户端断开 → 销毁上游连接（修复连接泄漏挤爆连接池的问题）
-    res.on('close', () => { if (!stream.destroyed) stream.destroy(); });
+    // 客户端断开 → 销毁上游连接（修复连接泄漏挤爆连接池的问题）；只有"响应未写完就关闭"才算主动断流
+    res.on('close', () => { if (!res.writableEnded) clientGone = true; if (!stream.destroyed) stream.destroy(); });
     return;
   }
 
@@ -1931,6 +2101,7 @@ server = http.createServer((req, res) => {
       if (result.statusCode >= 200 && result.statusCode < 300) {
         try { usage = (JSON.parse(result.body).usage) || null; } catch (e) {}
       }
+      if (clientGone) { return; } // WB-004: 客户端已断开，不计任何指标
       recordAttempt(modelName, cand.provider, Date.now() - t0, result.statusCode, result.statusCode >= 200 && result.statusCode < 300 && isValidCompletion(result.body), false, usage);
 
       if (result.statusCode >= 200 && result.statusCode < 300) {
@@ -1943,6 +2114,7 @@ server = http.createServer((req, res) => {
         }
         markProviderSuccess(cand.provider);
         markModelSuccess(modelName);
+        stickyOnSuccess(modelKey, cand.provider); // 成功归因：初始化/粘性站自证；TENTATIVE 承接不覆盖粘性
         console.log(`  ✅ ${cand.provider} [${result.statusCode}] model=${modelName}`);
         res.writeHead(result.statusCode, result.headers);
         res.end(result.body);
@@ -1951,7 +2123,7 @@ server = http.createServer((req, res) => {
       }
 
       if (shouldFailover(result.statusCode, result.body)) {
-        markProviderFailed(cand.provider);
+        if (result.statusCode !== 429) markProviderFailed(cand.provider); // WB-004: 429 是限流不是站故障，不计失败计数（防稳定但配额小的站被误隔离）
         if (result.statusCode >= 500) markProvider5xx(cand.provider); // 5xx 熔断计数
         if (result.statusCode === 429) markProvider429(cand.provider, result.body); // 429：按类型（速率/额度）分别处理
         if (isModelLevelError(result.statusCode, result.body, isValidCompletion(result.body))) {
