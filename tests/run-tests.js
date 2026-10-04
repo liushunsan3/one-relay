@@ -167,14 +167,15 @@ runGroup('sticky-wilson', `
   eq(stickyTable.m1 && stickyTable.m1.station, 'A', '首次成功 → 初始化粘性');
   stickyTentative.m1 = { station: 'B', since: 1 };   // 粘性站A暂不可用，B承接
   stickyOnSuccess('m1', 'B');
-  eq(stickyTable.m1.station, 'A', '★TENTATIVE 承接成功不覆盖粘性（保留回切能力）');
-  stickyOnSuccess('m1', 'A');
-  eq(stickyTentative.m1, undefined, '粘性站自己成功 → 清除 TENTATIVE（回切完成）');
+  eq(stickyTable.m1.station, 'B', '★承接成功后粘性转移给新站（用户策略 2026-10-04：不回切旧站）');
+  eq(stickyTentative.m1, undefined, '转移成功后清除 TENTATIVE');
+  stickyOnSuccess('m1', 'B');
+  eq(stickyTable.m1.station, 'B', '同站再次成功 → 粘性保持不动');
   stickySet('m1', 'C', '劣化复核');
   eq(stickyTable.m1.station, 'C', '劣化复核主动换站写入粘性');
   stickyKeep('m1', 'D');
-  eq(stickyTentative.m1.station, 'D', 'stickyKeep 记录 TENTATIVE 承接者');
-  eq(stickyTable.m1.station, 'C', 'stickyKeep 不改动粘性表');
+  eq(stickyTentative.m1.station, 'D', 'stickyKeep 记录承接中的临时站');
+  eq(stickyTable.m1.station, 'C', 'stickyKeep 不改动粘性表（要等承接成功才转移）');
 `);
 
 // ================================================================

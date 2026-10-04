@@ -528,8 +528,10 @@ function fixTool(tool) {
 // ============ 粘性路由（Winner Stays，WB-004 评审定稿） ============
 // 分层原则：可用性/配额=硬约束（一票否决）；粘性=强偏好（命中即首选，跳过评分）；
 // 评分=仅在必须换站时用的一次性选择器。防抖主力是「换站静默期」而非分数门槛。
+// 转移策略（2026-10-04 用户拍板）：**换站成功后粘性即转移给新站，不回切旧站**——
+// 避免在两站间来回横跳毁缓存；粘性始终 = 当前真正在伺候该模型的站。
 const stickyTable = {};                     // model(小写) -> { station, since, lastSwitchAt }
-const stickyTentative = {};                 // model -> { station, since }（粘性站暂不可用时承接者，仅内存不落盘）
+const stickyTentative = {};                 // model -> { station, since }（承接中尚未成功的临时观测，仅内存）
 const SWITCH_COOLDOWN_MS = 300 * 1000;      // 换站静默期：除硬失败外 5 分钟内不再次换站
 const DEGRADE_TOTAL_RATIO = 1.5;            // 劣化复核阈值：粘性站 EMA 延迟 > 最优 ×1.5 → 触发重选
 const STICKY_WAIT_CAP_MS = 1500;            // 粘性站限速满时的有界等待上限（等待保缓存优于换站烧缓存）
@@ -560,12 +562,14 @@ function stickySave() {
   try { atomicWrite(STICKY_FILE, JSON.stringify(stickyTable, null, 2)); stickyDirty = false; } catch (e) {}
 }
 setInterval(stickySave, 30000).unref();
-// 成功归因：初始化/粘性站自己成功才写粘性；TENTATIVE 承接成功不覆盖（保留回切能力）
+// 成功归因（用户策略 2026-10-04：**换站后优先用换了的站，不回切旧站**）
+// 任何成功都把粘性指向该站——粘性始终跟随"当前真正在伺候这个模型的站"，避免在两个站之间来回横跳毁缓存。
 function stickyOnSuccess(model, station) {
   const key = String(model || '').toLowerCase();
   const s = stickyTable[key];
   if (!s) stickySet(key, station, '初始化');
-  else if (s.station === station) delete stickyTentative[key];
+  else if (s.station !== station) stickySet(key, station, '故障转移后成功→转移到新站');
+  delete stickyTentative[key];
 }
 
 // ============ 路由指标：EMA（站×模型双维度）+ Wilson 下界（WB-004 评审定稿） ============
@@ -1934,8 +1938,9 @@ server = http.createServer((req, res) => {
 
     const modelName = parsed.model || '';
     const clientId = ++clientSeq;
-    const candidates = sortCandidates(findProviders(modelName)).filter(c => isProviderHealthy(c.provider));
-    const rawList = candidates.length > 0 ? candidates : sortCandidates(findProviders(modelName));
+    const allCands = sortCandidates(findProviders(modelName)); // 全量候选（含暂时不可用的站，供粘性判定区分"被移除"与"暂时不可用"）
+    const candidates = allCands.filter(c => isProviderHealthy(c.provider));
+    const rawList = candidates.length > 0 ? candidates : allCands;
 
     if (rawList.length === 0) {
       const available = availableModels();
@@ -1998,11 +2003,16 @@ server = http.createServer((req, res) => {
         }
         if (!stickyCand) stickyCand = sc; // 粘性站首选（跳过评分比较）
         delete stickyTentative[modelKey]; // 粘性站恢复承接，清 TENTATIVE
-      } else if (rawList.some(x => x.provider === sticky.station)) {
-        // 粘性站在候选里但被排除（限速满/冷却）：TENTATIVE 承接，保留粘性记录等回切
+      } else if (allCands.some(x => x.provider === sticky.station)) {
+        // 粘性站**存在但暂时不可用**（失败隔离/5xx冷却/429冷却/限速满）：由备选承接，粘性暂不清——
+        // 承接成功后 stickyOnSuccess 会把粘性转移给承接站（用户策略：不回切）。
+        // 用 allCands 判定（而非过滤后的 rawList），避免"站被隔离"被误判成"站被移除"而清掉粘性。
         stickyKeep(modelKey, sticky.station);
-        // 有界等待档：仅「限速满」（无 429 冷却）时值得等——换站烧缓存，等待成本更低
-        if (!is429Cooling(sticky.station)) {
+        // 有界等待档：**仅「单纯限速满」才值得等**（等 1.5s 保缓存优于换站烧缓存）。
+        // 若粘性站是被失败隔离/5xx冷却/429冷却排除，几秒钟等不回来 → 直接由备选承接（成功后粘性转移）。
+        const waitWorthIt = !canSendNow(sticky.station) && isProviderHealthy(sticky.station)
+          && !is429Cooling(sticky.station) && !is5xxCooling(sticky.station);
+        if (waitWorthIt) {
           const ok = await (async () => {
             const deadline = Date.now() + STICKY_WAIT_CAP_MS;
             while (Date.now() < deadline) {
