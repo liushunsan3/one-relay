@@ -647,6 +647,13 @@ function sortCandidates(matches) {
   });
 }
 
+// 定时重算评分（15s）：让「限速已满（rps/rpm 窗口滑过）/ 429 冷却 / 5xx 冷却」这类
+// **时间性惩罚**能自动过期恢复。否则这些惩罚靠事件（请求/探活）驱动重算，站一旦被垫底
+// 就再无请求触发重算 → 卡在低分被永久垫底（实测商汤 rpm 满后评分停在 1 分，窗口空了也不恢复）。
+setInterval(() => {
+  for (const n of Object.keys(PROVIDERS)) computeProviderScore(n);
+}, 15000).unref();
+
 // ============ 站点评分（智能路由依据；评分错不影响主流程） ============
 const providerScores = {}; // name -> { score, detail, ms }
 function computeProviderScore(name) {
