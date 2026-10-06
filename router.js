@@ -867,11 +867,11 @@ function summarizeStats(range) {
     clientOk += b.clientOk || 0;
     for (const [n, c] of Object.entries(b.byProvider || {})) {
       const t = ensureCell(byProvider, n);
-      t.reqs += c.reqs; t.ok += c.ok; t.fail += c.fail; t.ms += c.ms; t.tin += c.tin; t.tout += c.tout;
+      t.reqs += c.reqs; t.ok += c.ok; t.fail += c.fail; t.ms += c.ms; t.tin += c.tin; t.tout += c.tout; t.cached += c.cached || 0;
     }
     for (const [n, c] of Object.entries(b.byModel || {})) {
       const t = ensureCell(byModel, n);
-      t.reqs += c.reqs; t.ok += c.ok; t.fail += c.fail; t.ms += c.ms; t.tin += c.tin; t.tout += c.tout;
+      t.reqs += c.reqs; t.ok += c.ok; t.fail += c.fail; t.ms += c.ms; t.tin += c.tin; t.tout += c.tout; t.cached += c.cached || 0;
     }
   }
   return { days: use, byProvider, byModel, clientReqs, clientOk };

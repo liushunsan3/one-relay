@@ -12,7 +12,14 @@ function fmtTime(ts) {
   return new Date(ts).toLocaleString('zh-CN', { hour12: false });
 }
 function fmtClock(ts) {
-  return new Date(ts).toLocaleTimeString('zh-CN', { hour12: false });
+  const d = new Date(ts);
+  const hms = d.toLocaleTimeString('zh-CN', { hour12: false });
+  const today = new Date();
+  // 跨天的历史记录补上日期，避免「最近请求」表里不同日期的记录被误读成同一天
+  if (d.toDateString() !== today.toDateString()) {
+    return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${hms}`;
+  }
+  return hms;
 }
 function fmtDur(sec) {
   if (sec < 60) return sec + ' 秒';
@@ -1491,9 +1498,10 @@ function statsTable(map) {
     const c = map[n];
     const rate = c.reqs ? Math.round(c.ok / c.reqs * 100) : 0;
     const avg = c.reqs ? Math.round(c.ms / c.reqs) : 0;
-    return `<tr><td>${escapeHtml(n)}</td><td>${c.reqs}</td><td>${c.ok}</td><td>${c.fail}</td><td>${rate}%</td><td>${avg}ms</td><td>${c.tin || '-'}</td><td>${c.tout || '-'}</td><td>${c.cached ? fmtTokens(c.cached) : '-'}</td></tr>`;
+    const hit = c.tin ? Math.round((c.cached || 0) / c.tin * 100) : 0;
+    return `<tr><td>${escapeHtml(n)}</td><td>${c.reqs}</td><td>${c.ok}</td><td>${c.fail}</td><td>${rate}%</td><td>${avg}ms</td><td>${fmtTokens(c.tin || 0)}</td><td>${fmtTokens(c.tout || 0)}</td><td>${c.cached ? fmtTokens(c.cached) : '-'}</td><td>${c.tin ? hit + '%' : '-'}</td></tr>`;
   }).join('');
-  return `<thead><tr><th>名称</th><th>请求数</th><th>成功</th><th>失败</th><th>成功率</th><th>平均延迟</th><th>输入token</th><th>输出token</th><th>缓存命中</th></tr></thead><tbody>${rows}</tbody>`;
+  return `<thead><tr><th>名称</th><th>请求数</th><th>成功</th><th>失败</th><th>成功率</th><th>平均延迟</th><th>输入token</th><th>输出token</th><th>缓存命中</th><th>命中率</th></tr></thead><tbody>${rows}</tbody>`;
 }
 
 /* 模型用量环形图（Token 占比，纯 CSS conic-gradient 零依赖）
