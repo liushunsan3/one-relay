@@ -2,6 +2,15 @@
 
 本文件记录 One-Relay 的重要变更，最新在前。更详细的设计说明见 [docs/DESIGN.md](docs/DESIGN.md)。
 
+## 2026-10-06
+
+### 修用量统计三处显示问题（commit fae2c0a）
+- 🔴 **`summarizeStats` 聚合漏累加 `cached`**：「最近7天 / 全部」范围的**「缓存命中」列恒为 0**——原始日桶其实有值（派云 37% / 英伟达 44% / 牛来 51%），被聚合函数吞掉了。修复后近 7 天命中率正常显示：**amd 89% / 牛来 85% / 商汤 64% / 商汤1 60%**——**粘性路由的缓存收益由此得到实测验证**。
+- 统计表「输入/输出 token」改用 `fmtTokens` 格式化（此前 `785652` 这种长串与旁边已格式化的列风格不一致）。
+- 统计表新增**「命中率」列**（cached/prompt_tokens），比裸 token 数直观。
+- `fmtClock` 跨天记录补日期（此前只显示时分秒，不同日期的历史记录被误读成同一天）。
+- **实测结论（关于缓存字段）**：魔搭（ModelScope）**不返回缓存字段**（usage 只有 prompt/completion/total）→ 其 cached 恒 0 属如实反映；商汤/牛来返回 `prompt_tokens_details.cached_tokens`，且**流式响应也带**（前提是请求带 `stream_options.include_usage`，代理已自动加）。
+
 ## 2026-10-04
 
 ### 路由架构升级：粘性路由 + 指标口径重做（按工作台 WB-004 评审定稿实施）
