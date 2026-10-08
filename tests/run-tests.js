@@ -138,47 +138,6 @@ runGroup('findProviders-case', `
 `);
 
 // ================================================================
-// 组2c：Wilson 下界 + 粘性路由状态机（WB-004 评审定稿的核心机制）
-// ================================================================
-runGroup('sticky-wilson', `
-  ${extractFn(routerSrc, 'wilsonLower')}
-  // Wilson 语义
-  const w0 = wilsonLower(0, 0);
-  eq(w0, 0.7, '冷启动(<5样本)继承乐观 0.7 语义（防新站饿死，Wilson 下界天生保守不能用）');
-  eq(wilsonLower(1, 2), 0.7, '小样本(<5)同样乐观');
-  const w1 = wilsonLower(49, 50);
-  const w2 = wilsonLower(48, 50);
-  ok(w1 > 0.85, '大样本高成功率 → 高下界');
-  ok(w1 - w2 < 0.05, '大样本一次失败几乎不动（无台阶跳变）');
-  const w3 = wilsonLower(20, 25);
-  ok(w3 < w1, '低成功率站下界低（Wilson 生效门槛=5样本）');
-  const wSame = wilsonLower(90, 100), wFlap = wilsonLower(45, 50);
-  ok(wSame > wFlap, '★同样均值：稳定站(90/100)下界高于忽好忽坏站(45/50)——奖励低方差');
-
-  // 粘性状态机
-  ${extractFn(routerSrc, 'stickySet')}
-  ${extractFn(routerSrc, 'stickyKeep')}
-  ${extractFn(routerSrc, 'stickyOnSuccess')}
-  const stickyTable = {}, stickyTentative = {};
-  let stickyDirty = false;
-  function logSwitch() {}
-
-  stickyOnSuccess('m1', 'A');
-  eq(stickyTable.m1 && stickyTable.m1.station, 'A', '首次成功 → 初始化粘性');
-  stickyTentative.m1 = { station: 'B', since: 1 };   // 粘性站A暂不可用，B承接
-  stickyOnSuccess('m1', 'B');
-  eq(stickyTable.m1.station, 'B', '★承接成功后粘性转移给新站（用户策略 2026-10-04：不回切旧站）');
-  eq(stickyTentative.m1, undefined, '转移成功后清除 TENTATIVE');
-  stickyOnSuccess('m1', 'B');
-  eq(stickyTable.m1.station, 'B', '同站再次成功 → 粘性保持不动');
-  stickySet('m1', 'C', '劣化复核');
-  eq(stickyTable.m1.station, 'C', '劣化复核主动换站写入粘性');
-  stickyKeep('m1', 'D');
-  eq(stickyTentative.m1.station, 'D', 'stickyKeep 记录承接中的临时站');
-  eq(stickyTable.m1.station, 'C', 'stickyKeep 不改动粘性表（要等承接成功才转移）');
-`);
-
-// ================================================================
 // 组3：429 分类型处理（速率类只冷却 / 额度类才停用）+ 提醒计数（mock 时钟）
 // ================================================================
 runGroup('429-suspend', `

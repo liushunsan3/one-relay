@@ -12,14 +12,7 @@ function fmtTime(ts) {
   return new Date(ts).toLocaleString('zh-CN', { hour12: false });
 }
 function fmtClock(ts) {
-  const d = new Date(ts);
-  const hms = d.toLocaleTimeString('zh-CN', { hour12: false });
-  const today = new Date();
-  // 跨天的历史记录补上日期，避免「最近请求」表里不同日期的记录被误读成同一天
-  if (d.toDateString() !== today.toDateString()) {
-    return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${hms}`;
-  }
-  return hms;
+  return new Date(ts).toLocaleTimeString('zh-CN', { hour12: false });
 }
 function fmtDur(sec) {
   if (sec < 60) return sec + ' 秒';
@@ -153,8 +146,6 @@ function renderStatus(s) {
       ${rs.stopped ? '<span class="k" style="color:var(--bad)">自动重启</span><span style="color:var(--bad)">已停止（配置错误），请从托盘「重启服务」恢复</span>' : ''}
       <span class="k">探活间隔</span><span>${s.probeIntervalMin} 分钟</span>
       <span class="k">Provider</span><span>${s.providers.length} 个站 / ${s.models.length} 个模型</span>
-      <span class="k">缓存命中(今日)</span><span title="粘性路由的验证指标：同一对话粘住同一个站时此值上升">${s.cacheHitRate == null ? '—' : s.cacheHitRate + '%'}</span>
-      ${(() => { const sk = Object.entries(s.sticky || {}); const tn = Object.entries(s.tentative || {}); if (!sk.length && !tn.length) return ''; const seg = sk.map(([m, v]) => `${escapeHtml(m)} → ${escapeHtml(v.station)}`).join('、') + tn.map(([m, v]) => `${escapeHtml(m)} ⇢ ${escapeHtml(v.station)}(暂替)`).join('、'); return `<span class="k" title="粘性路由：模型当前偏好的站；⇢暂替=粘性站暂不可用时的承接者">粘性路由</span><span>${seg}</span>`; })()}
       ${s.kickedCount > 0 ? `<span class="k" style="color:var(--bad)">已踢出</span><span style="color:var(--bad)">${s.kickedCount} 个废站（Provider 页可清理/恢复）</span>` : ''}
     </div>`;
 
@@ -1498,10 +1489,9 @@ function statsTable(map) {
     const c = map[n];
     const rate = c.reqs ? Math.round(c.ok / c.reqs * 100) : 0;
     const avg = c.reqs ? Math.round(c.ms / c.reqs) : 0;
-    const hit = c.tin ? Math.round((c.cached || 0) / c.tin * 100) : 0;
-    return `<tr><td>${escapeHtml(n)}</td><td>${c.reqs}</td><td>${c.ok}</td><td>${c.fail}</td><td>${rate}%</td><td>${avg}ms</td><td>${fmtTokens(c.tin || 0)}</td><td>${fmtTokens(c.tout || 0)}</td><td>${c.cached ? fmtTokens(c.cached) : '-'}</td><td>${c.tin ? hit + '%' : '-'}</td></tr>`;
+    return `<tr><td>${escapeHtml(n)}</td><td>${c.reqs}</td><td>${c.ok}</td><td>${c.fail}</td><td>${rate}%</td><td>${avg}ms</td><td>${c.tin || '-'}</td><td>${c.tout || '-'}</td><td>${c.cached ? fmtTokens(c.cached) : '-'}</td></tr>`;
   }).join('');
-  return `<thead><tr><th>名称</th><th>请求数</th><th>成功</th><th>失败</th><th>成功率</th><th>平均延迟</th><th>输入token</th><th>输出token</th><th>缓存命中</th><th>命中率</th></tr></thead><tbody>${rows}</tbody>`;
+  return `<thead><tr><th>名称</th><th>请求数</th><th>成功</th><th>失败</th><th>成功率</th><th>平均延迟</th><th>输入token</th><th>输出token</th><th>缓存命中</th></tr></thead><tbody>${rows}</tbody>`;
 }
 
 /* 模型用量环形图（Token 占比，纯 CSS conic-gradient 零依赖）
