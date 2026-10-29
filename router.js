@@ -566,6 +566,13 @@ function sortCandidates(matches) {
 }
 
 // ============ 站点评分（智能路由依据；评分错不影响主流程） ============
+// 定时重算评分（15s）：让「限速已满（rps/rpm 窗口滑过）/ 429 冷却 / 5xx 冷却」这类
+// **时间性惩罚**能自动过期恢复。否则这些惩罚靠事件（请求/探活）驱动重算，站一旦被垫底
+// 就再无请求触发重算 → 卡在低分被永久垫底（实测商汤 rpm 满后评分停在 1 分，窗口空了也不恢复）。
+setInterval(() => {
+  for (const n of Object.keys(PROVIDERS)) computeProviderScore(n);
+}, 15000).unref();
+
 const providerScores = {}; // name -> { score, detail, ms }
 function computeProviderScore(name) {
   try {
@@ -609,26 +616,35 @@ function computeProviderScore(name) {
 }
 
 // ============ 发送请求（支持流式透传） ============
+const HEAD_TIMEOUT = 45000; // 响应头绝对超时：空闲超时管不住「接受连接但慢慢滴数据」的假活站，必须加绝对上限
 function sendRequest(options, body) {
   return new Promise((resolve, reject) => {
     const transport = options.protocol === 'https:' ? https : http;
+    let settled = false;
+    let headTimer = null;
+    const done = (fn, arg) => { if (!settled) { settled = true; if (headTimer) clearTimeout(headTimer); fn(arg); } };
     const req = transport.request(options, (proxyRes) => {
+      if (headTimer) { clearTimeout(headTimer); headTimer = null; } // 响应头已到，绝对超时使命完成（后续流式传输不受限）
       const contentType = proxyRes.headers['content-type'] || '';
       if (proxyRes.statusCode === 200 && contentType.includes('text/event-stream')) {
-        resolve({ statusCode: proxyRes.statusCode, headers: proxyRes.headers, stream: proxyRes });
+        done(resolve, { statusCode: proxyRes.statusCode, headers: proxyRes.headers, stream: proxyRes });
         return;
       }
       let data = '';
       proxyRes.on('data', chunk => { data += chunk; });
       proxyRes.on('end', () => {
-        resolve({ statusCode: proxyRes.statusCode, headers: proxyRes.headers, body: data });
+        done(resolve, { statusCode: proxyRes.statusCode, headers: proxyRes.headers, body: data });
       });
     });
 
+    headTimer = setTimeout(() => {
+      console.log(`  ⏰ [响应头超时 ${HEAD_TIMEOUT}ms] ${options.hostname}${options.path} 强制断开`);
+      req.destroy(new Error('响应头超时'));
+    }, HEAD_TIMEOUT);
     req.setTimeout(UPSTREAM_TIMEOUT, () => {
       req.destroy(new Error('upstream timeout'));
     });
-    req.on('error', reject);
+    req.on('error', (e) => done(reject, e));
     req.write(body);
     req.end();
   });
@@ -659,8 +675,11 @@ function buildOptions(cand, upstreamPath, targetBody) {
   };
 }
 
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 10 });
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 10 });
+// keep-alive 关闭：上游中转站经常静默关闭空闲连接，客户端复用僵尸 socket 会「写进死连接、无响应」挂死
+// （实测小米站直连 0.2s 秒回 402，但代理侧因复用僵尸连接挂满 120s）。每次新建连接的代价（~200ms TLS）
+// 远小于挂死代价，故不复用连接。
+const httpsAgent = new https.Agent({ keepAlive: false });
+const httpAgent = new http.Agent({ keepAlive: false });
 
 // ============ 用量统计（按天分桶）+ 请求历史 ============
 const statsPath = path.join(APP_DIR, 'stats.json');
@@ -761,11 +780,11 @@ function summarizeStats(range) {
     clientOk += b.clientOk || 0;
     for (const [n, c] of Object.entries(b.byProvider || {})) {
       const t = ensureCell(byProvider, n);
-      t.reqs += c.reqs; t.ok += c.ok; t.fail += c.fail; t.ms += c.ms; t.tin += c.tin; t.tout += c.tout;
+      t.reqs += c.reqs; t.ok += c.ok; t.fail += c.fail; t.ms += c.ms; t.tin += c.tin; t.tout += c.tout; t.cached += c.cached || 0;
     }
     for (const [n, c] of Object.entries(b.byModel || {})) {
       const t = ensureCell(byModel, n);
-      t.reqs += c.reqs; t.ok += c.ok; t.fail += c.fail; t.ms += c.ms; t.tin += c.tin; t.tout += c.tout;
+      t.reqs += c.reqs; t.ok += c.ok; t.fail += c.fail; t.ms += c.ms; t.tin += c.tin; t.tout += c.tout; t.cached += c.cached || 0;
     }
   }
   return { days: use, byProvider, byModel, clientReqs, clientOk };
@@ -1474,6 +1493,10 @@ async function handleAdmin(req, res, reqUrl) {
       availableModels: [...new Set([...cfg.models, ...Object.keys(cfg.aliases)])].filter(m => !isModelUnavailable(m)),
     }));
     const a = settings.assistant || {};
+    // 缓存命中率（当天口径，趋势指标）：cached / prompt_tokens
+    let tinSum = 0, cachedSum = 0;
+    const tb = stats[todayKey()];
+    if (tb) for (const c of Object.values(tb.byProvider || {})) { tinSum += c.tin || 0; cachedSum += c.cached || 0; }
     sendJSON(res, 200, {
       port: MY_PORT,
       uptime: Math.floor((Date.now() - startedAt) / 1000),
@@ -1486,6 +1509,7 @@ async function handleAdmin(req, res, reqUrl) {
       bindLan: settings.bindLan === true,
       lanIP: currentHost === '0.0.0.0' ? (lanIPv4() || '') : '',
       apiKeyMasked: maskKey(settings.apiKey),
+      cacheHitRate: tinSum > 0 ? Math.round(cachedSum / tinSum * 100) : null,
       assistant: { baseUrl: a.baseUrl, keyMasked: maskKey(a.key), model: a.model || '' },
       probeIntervalMin: settings.probeIntervalMin,
     });
@@ -1951,7 +1975,7 @@ server = http.createServer((req, res) => {
       }
 
       if (shouldFailover(result.statusCode, result.body)) {
-        markProviderFailed(cand.provider);
+        if (result.statusCode !== 429) markProviderFailed(cand.provider); // 429 是限流不是站故障，不计失败计数（防稳定但配额小的站被 5 分钟隔离）
         if (result.statusCode >= 500) markProvider5xx(cand.provider); // 5xx 熔断计数
         if (result.statusCode === 429) markProvider429(cand.provider, result.body); // 429：按类型（速率/额度）分别处理
         if (isModelLevelError(result.statusCode, result.body, isValidCompletion(result.body))) {
