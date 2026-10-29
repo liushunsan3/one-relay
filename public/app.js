@@ -557,17 +557,17 @@ function openProviderModal(name) {
       aliases,
       enabled: $('#fEnabled').checked,
     };
+    // 限速：填 0 或留空 = 不限速。**必须显式传 0**（不能 delete）——
+// 因为后端 PUT /admin/api/providers 用 {...old, ...np} 合并，np 缺字段时 old 的旧限速值会被原样保留，导致"设 0 保存不了"。
     const rpsVal = parseInt($('#fRps').value, 10);
-    if (rpsVal > 0) item.rps = rpsVal; else delete item.rps; // 留空/0 = 不限速（删掉字段）
+    item.rps = rpsVal > 0 ? rpsVal : 0;
     const rpmVal = parseInt($('#fRpm').value, 10);
-    if (rpmVal > 0) item.rpm = rpmVal; else delete item.rpm;
+    item.rpm = rpmVal > 0 ? rpmVal : 0;
     if (!item.name || !item.baseUrl || !item.models.length) { toast('站名、地址、模型列表不能为空', 'err'); btn.disabled = false; return; }
     const idx = list.findIndex(x => x.name === item.name);
     if (p && idx >= 0) {
       const merged = { ...list[idx], ...item };
       if (!item.key) merged.key = list[idx].key;
-      if (!item.rps) delete merged.rps;   // 清空限速 = 取消（spread 会保留旧值，需显式删）
-      if (!item.rpm) delete merged.rpm;
       list[idx] = merged;
     } else {
       if (idx >= 0) { toast(`已存在同名站「${item.name}」，请换名字或用编辑`, 'err'); btn.disabled = false; return; }
